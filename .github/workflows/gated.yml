@@ -1,0 +1,122 @@
+name: Refit gated suites
+
+# Runs Refit's Docker, PostgreSQL and oasdiff test suites at one commit, for laptops without Docker
+# and while Refit's own Actions are off. They use no secret beyond the read token and reach no
+# paid API. Logs are public; the suites print test names and assertion diffs only.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to test
+        required: true
+      suite:
+        description: Which gated suites to run
+        type: choice
+        options: [all, postgres, docker, oasdiff]
+        default: all
+
+permissions: {}
+
+env:
+  OASDIFF_VERSION: 1.33.0
+  # Source: https://github.com/oasdiff/oasdiff/releases/download/v1.33.0/checksums.txt, 2026-10-22
+  OASDIFF_SHA256: 43a4e328e2d13ba1552d760aa68d2485c75c5621f309f6ff64ae895188345247
+  # Source: docker buildx imagetools inspect node:22-alpine, 2026-10-22
+  NODE_IMAGE_DIGEST: sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
+
+jobs:
+  oasdiff:
+    if: inputs.suite == 'all' || inputs.suite == 'oasdiff'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: .github/scripts/install-oasdiff.sh "$OASDIFF_VERSION" "$OASDIFF_SHA256"
+      - env:
+          REFIT_OASDIFF: '1'
+        run: .github/scripts/run-gated.sh REFIT_OASDIFF
+
+  docker:
+    if: inputs.suite == 'all' || inputs.suite == 'docker'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: .github/scripts/install-oasdiff.sh "$OASDIFF_VERSION" "$OASDIFF_SHA256"
+      # Validation runs with --pull never, so the pinned image is pulled and named here.
+      - run: |
+          docker pull "node@$NODE_IMAGE_DIGEST"
+          docker tag "node@$NODE_IMAGE_DIGEST" node:22-alpine
+      - env:
+          REFIT_DOCKER_IMAGE: node:22-alpine
+          REFIT_NPM_PREPARE: '1'
+          REFIT_OASDIFF: '1'
+        run: .github/scripts/run-gated.sh REFIT_DOCKER_IMAGE REFIT_NPM_PREPARE
+
+  postgres:
+    if: inputs.suite == 'all' || inputs.suite == 'postgres'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # Source: docker buildx imagetools inspect postgres:17-alpine, 2026-10-22
+        image: postgres:17-alpine@sha256:1bcc18d81671b02906296aad470ec9778a6b71016ce953092024b680bad007b0
+        env:
+          POSTGRES_USER: refit
+          POSTGRES_PASSWORD: refit-ci-only
+          POSTGRES_DB: refit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U refit"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The hosted end-to-end test also validates in Docker with oasdiff.
+      - run: .github/scripts/install-oasdiff.sh "$OASDIFF_VERSION" "$OASDIFF_SHA256"
+      - run: |
+          docker pull "node@$NODE_IMAGE_DIGEST"
+          docker tag "node@$NODE_IMAGE_DIGEST" node:22-alpine
+      - env:
+          REFIT_POSTGRES_URL: postgres://refit:refit-ci-only@127.0.0.1:5432/refit
+          REFIT_DOCKER_IMAGE: node:22-alpine
+          REFIT_OASDIFF: '1'
+        run: .github/scripts/run-gated.sh REFIT_POSTGRES_URL
