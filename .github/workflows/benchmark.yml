@@ -25,6 +25,14 @@ on:
         description: Repositories to run from the offset (blank runs the rest of the list)
         required: false
         default: '5'
+      ai:
+        description: Run AI patches and repair (spends the OPENAI_API_KEY secret's budget)
+        type: boolean
+        default: false
+      ai_budget:
+        description: AI cap in USD for the whole run, split evenly across shards (at most 20)
+        required: false
+        default: '2'
       flags:
         description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env)
         required: false
@@ -43,6 +51,7 @@ jobs:
     outputs:
       shards: ${{ steps.shards.outputs.shards }}
       end: ${{ steps.shards.outputs.end }}
+      shard_budget: ${{ steps.shards.outputs.shard_budget }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +75,8 @@ jobs:
           OFFSET: ${{ inputs.offset }}
           SIZE: ${{ inputs.size }}
           COUNT: ${{ inputs.count }}
+          AI: ${{ inputs.ai }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
         run: |
           total=$(jq '.repos | length' "docs/benchmarks/$LIST")
           count=$((total - OFFSET))
@@ -74,6 +85,13 @@ jobs:
           shards=$(((count + SIZE - 1) / SIZE))
           if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
           echo "$count repositories in $shards shards"
+          if [ "$AI" = true ]; then
+            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 20) }'; then
+              echo "::error::ai_budget must be a number above 0 and at most 20"; exit 1
+            fi
+            echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
+            echo "AI cap: \$$AI_BUDGET for the run"
+          fi
           echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
           echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
 
@@ -114,12 +132,25 @@ jobs:
           SHARD: ${{ matrix.shard }}
           END: ${{ needs.plan.outputs.end }}
           FLAGS: ${{ inputs.flags }}
+          AI: ${{ inputs.ai }}
+          SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
+          OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
         run: |
+          ai=()
+          if [ "$AI" = true ]; then
+            if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+            # Ledger per shard; the run's total is ai_budget.
+            printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=gpt-5.6-luna\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+              "$OPENAI_API_KEY" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            unset OPENAI_API_KEY
+            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+          fi
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
           node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit"
           mkdir -p "$RUNNER_TEMP/out"
-          npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate $FLAGS
+          npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
+          rm -f "$RUNNER_TEMP/ai.env"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -147,6 +178,7 @@ jobs:
             echo "|---|---|---|---|"
             cat shards/shard-*/run/summary.md | grep -E '^\| [^ ]+/[^ ]+ \|' || true
           } > merged/summary.md
+          echo "AI spend: \$$(jq '[.[] | (.workflow.aiCostUsd // 0) + (.ai.costUsd // 0)] | add // 0' merged/results.json)" >> merged/summary.md
           cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
