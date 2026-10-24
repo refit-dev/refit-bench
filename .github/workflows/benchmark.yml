@@ -36,8 +36,8 @@ on:
       model:
         description: OpenAI model for AI patches (priced in pipeline/ai-budget.ts)
         type: choice
-        options: [gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol]
-        default: gpt-5.6-sol
+        options: [gpt-6.1-sol, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]
+        default: gpt-6.1-sol
       flags:
         description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env)
         required: false
