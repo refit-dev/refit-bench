@@ -25,6 +25,10 @@ on:
         description: Repositories to run from the offset (blank runs the rest of the list)
         required: false
         default: '5'
+      flags:
+        description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -48,6 +52,14 @@ jobs:
           sparse-checkout: docs/benchmarks
           persist-credentials: false
       # One shard per `size` repositories; GitHub caps a matrix at 256 jobs.
+      - name: Check flags
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(ai|env|publish)[\ =] ]]; then
+            echo "::error::flags may hold only plain options, and never --ai, --env or --publish"
+            exit 1
+          fi
       - id: shards
         env:
           LIST: ${{ inputs.list }}
@@ -101,15 +113,42 @@ jobs:
           SIZE: ${{ inputs.size }}
           SHARD: ${{ matrix.shard }}
           END: ${{ needs.plan.outputs.end }}
+          FLAGS: ${{ inputs.flags }}
         run: |
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
           node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit"
           mkdir -p "$RUNNER_TEMP/out"
-          npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate
+          npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate $FLAGS
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/out
           if-no-files-found: warn
+
+  merge:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Merge shard results
+        run: |
+          mkdir merged
+          jq -s add shards/shard-*/run/results.json > merged/results.json
+          {
+            echo "# Merged Stripe benchmark ($(jq length merged/results.json) repositories)"
+            echo
+            echo "| Repository | Outcome | Pull request | Reason |"
+            echo "|---|---|---|---|"
+            cat shards/shard-*/run/summary.md | grep -E '^\| [^ ]+/[^ ]+ \|' || true
+          } > merged/summary.md
+          cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: merged
+          path: merged
