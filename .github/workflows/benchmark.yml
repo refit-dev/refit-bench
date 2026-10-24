@@ -8,7 +8,7 @@ on:
       commit:
         description: Full 40-character Refit commit SHA to benchmark
         required: true
-        default: 502b8c0eaa52f828fe8f5de799606e78e2289821
+        default: 69635cc2be7bc3e04442e0bf853f8af7b48754bd
       list:
         description: Frozen repository list under docs/benchmarks
         required: true
