@@ -1,7 +1,7 @@
 name: Stripe benchmark
 
-# Runs the Refit Stripe benchmark without AI on GitHub-hosted runners, one job per shard.
-# Logs and artifacts of this public repository are public; never add secrets beyond the read token.
+# Runs the Refit Stripe benchmark on GitHub-hosted runners, one job per shard; AI only with `ai: true`.
+# Logs and artifacts of this public repository are public; secrets go only through repository secrets.
 on:
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ on:
         type: boolean
         default: false
       ai_budget:
-        description: AI cap in USD for the whole run, split evenly across shards (at most 20)
+        description: AI cap in USD for the whole run, split evenly across shards (at most 1000, the most Refit accepts)
         required: false
         default: '2'
       flags:
@@ -87,8 +87,8 @@ jobs:
           if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
           echo "$count repositories in $shards shards"
           if [ "$AI" = true ]; then
-            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 20) }'; then
-              echo "::error::ai_budget must be a number above 0 and at most 20"; exit 1
+            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 1000) }'; then
+              echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
             fi
             echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
             echo "AI cap: \$$AI_BUDGET for the run"
