@@ -154,7 +154,10 @@ jobs:
           fi
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
-          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit"
+          # A repository that no longer clones (deleted or private) must not cost the shard its other
+          # rows: setup still writes selected.json, and the benchmark records it as a clone failure.
+          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit" \
+            || echo "::warning::Setup could not clone every repository; the benchmark records each as a clone failure."
           mkdir -p "$RUNNER_TEMP/out"
           npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
           rm -f "$RUNNER_TEMP/ai.env"
