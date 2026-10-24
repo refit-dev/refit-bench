@@ -21,9 +21,9 @@ on:
         description: Repositories per shard
         required: true
         default: '1'
-      shards:
-        description: Number of shards
-        required: true
+      count:
+        description: Repositories to run from the offset (blank runs the rest of the list)
+        required: false
         default: '5'
 
 permissions:
@@ -38,11 +38,32 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       shards: ${{ steps.shards.outputs.shards }}
+      end: ${{ steps.shards.outputs.end }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          persist-credentials: false
+      # One shard per `size` repositories; GitHub caps a matrix at 256 jobs.
       - id: shards
         env:
-          SHARDS: ${{ inputs.shards }}
-        run: echo "shards=$(seq 0 $((SHARDS - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          total=$(jq '.repos | length' "docs/benchmarks/$LIST")
+          count=$((total - OFFSET))
+          if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
+          if [ "$count" -le 0 ]; then echo "::error::Offset $OFFSET is past the list's $total repositories"; exit 1; fi
+          shards=$(((count + SIZE - 1) / SIZE))
+          if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
+          echo "$count repositories in $shards shards"
+          echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
 
   shard:
     needs: plan
@@ -79,9 +100,11 @@ jobs:
           OFFSET: ${{ inputs.offset }}
           SIZE: ${{ inputs.size }}
           SHARD: ${{ matrix.shard }}
+          END: ${{ needs.plan.outputs.end }}
         run: |
           start=$((OFFSET + SHARD * SIZE))
-          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$SIZE"
+          limit=$((END - start < SIZE ? END - start : SIZE))
+          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit"
           mkdir -p "$RUNNER_TEMP/out"
           npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate
       - if: always()
