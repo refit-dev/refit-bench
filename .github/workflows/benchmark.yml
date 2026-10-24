@@ -20,11 +20,11 @@ on:
       size:
         description: Repositories per shard
         required: true
-        default: '5'
+        default: '1'
       shards:
         description: Number of shards
         required: true
-        default: '1'
+        default: '5'
 
 permissions:
   contents: read
