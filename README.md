@@ -1,6 +1,6 @@
 # refit-bench
 
-Runs the [Refit](https://github.com/pierceluu10/Refit) Stripe benchmark on GitHub-hosted runners, one job per shard, without AI. The full guide is `docs/GITHUB-BENCHMARKS.md` in the Refit repository.
+Runs the [Refit](https://github.com/pierceluu10/Refit) Stripe benchmark on GitHub-hosted runners, one job per shard. AI is off unless dispatched with `-f ai=true -f ai_budget=<USD>`. The full guide is `docs/GITHUB-BENCHMARKS.md` in the Refit repository.
 
 ```sh
 gh workflow run benchmark.yml -R refit-dev/refit-bench \
@@ -10,4 +10,4 @@ gh run download <run-id> -R refit-dev/refit-bench -D <dir>
 jq -s add <dir>/shard-*/run/results.json > <dir>/results.json
 ```
 
-Logs and artifacts here are public. The only secret is `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository; never add an API key.
+Logs and artifacts here are public. Secrets: `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository, and `OPENAI_API_KEY`, the owner's capped key, used only by AI runs. Never pass a key through an input.
