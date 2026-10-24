@@ -82,6 +82,7 @@ jobs:
         run: |
           start=$((OFFSET + SHARD * SIZE))
           node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$SIZE"
+          mkdir -p "$RUNNER_TEMP/out"
           npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate
       - if: always()
         uses: actions/upload-artifact@v4
