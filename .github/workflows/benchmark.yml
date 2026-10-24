@@ -1,0 +1,91 @@
+name: Stripe benchmark
+
+# Runs the Refit Stripe benchmark without AI on GitHub-hosted runners, one job per shard.
+# Logs and artifacts of this public repository are public; never add secrets beyond the read token.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Refit commit to benchmark
+        required: true
+        default: 502b8c0
+      list:
+        description: Frozen repository list under docs/benchmarks
+        required: true
+        default: 2026-10-16-stripe-fresh-repos.json
+      offset:
+        description: First repository of the first shard
+        required: true
+        default: '0'
+      size:
+        description: Repositories per shard
+        required: true
+        default: '5'
+      shards:
+        description: Number of shards
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+env:
+  OASDIFF_VERSION: 1.33.0
+  REFIT_DOCKER_IMAGE: node:22-alpine
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+    steps:
+      - id: shards
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: echo "shards=$(seq 0 $((SHARDS - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - name: Install oasdiff
+        run: |
+          curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin oasdiff
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - run: docker pull -q "$REFIT_DOCKER_IMAGE"
+      - name: Run benchmark
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          start=$((OFFSET + SHARD * SIZE))
+          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$SIZE"
+          npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
