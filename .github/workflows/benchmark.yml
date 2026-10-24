@@ -44,6 +44,7 @@ permissions:
 env:
   OASDIFF_VERSION: 1.33.0
   REFIT_DOCKER_IMAGE: node:22-alpine
+  STRIPE_MOCK_IMAGE: stripe/stripe-mock:latest
 
 jobs:
   plan:
@@ -122,7 +123,11 @@ jobs:
             | sudo tar -xz -C /usr/local/bin oasdiff
       - run: npm ci --no-audit --no-fund
         working-directory: refit
-      - run: docker pull -q "$REFIT_DOCKER_IMAGE"
+      # Refit never pulls images itself; generated checks need stripe-mock present locally.
+      - run: |
+          docker pull -q "$REFIT_DOCKER_IMAGE"
+          docker pull -q "$STRIPE_MOCK_IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" "$STRIPE_MOCK_IMAGE" | tee "$RUNNER_TEMP/images.txt"
       - name: Run benchmark
         working-directory: refit
         env:
@@ -135,6 +140,8 @@ jobs:
           AI: ${{ inputs.ai }}
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          # The runner has 16 GB; Node's default heap ran out on SimplerDevelopment.
+          NODE_OPTIONS: --max-old-space-size=8192
         run: |
           ai=()
           if [ "$AI" = true ]; then
@@ -151,6 +158,9 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
           npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
           rm -f "$RUNNER_TEMP/ai.env"
+          cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -159,28 +169,72 @@ jobs:
           if-no-files-found: warn
 
   merge:
-    needs: shard
+    needs: [plan, shard]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
       - uses: actions/download-artifact@v4
         with:
           pattern: shard-*
           path: shards
       - name: Merge shard results
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ needs.plan.outputs.end }}
+          COMMIT: ${{ inputs.commit }}
         run: |
           mkdir merged
-          jq -s add shards/shard-*/run/results.json > merged/results.json
+          shopt -s nullglob
+          files=(shards/shard-*/run/results.json)
+          if [ ${#files[@]} -gt 0 ]; then jq -s add "${files[@]}" > merged/results.json; else echo '[]' > merged/results.json; fi
+          # Every repository the plan assigned must have exactly one row.
+          jq -r --argjson offset "$OFFSET" --argjson end "$END" '.repos[$offset:$end][].repo' "refit/docs/benchmarks/$LIST" | sort > merged/expected.txt
+          jq -r '.[].repo' merged/results.json | sort > merged/present.txt
+          comm -23 merged/expected.txt <(sort -u merged/present.txt) > merged/missing.txt
+          comm -13 merged/expected.txt <(sort -u merged/present.txt) > merged/unexpected.txt
+          uniq -d merged/present.txt > merged/duplicated.txt
+          cat shards/shard-*/images.txt 2>/dev/null | sort -u > merged/images.txt || true
           {
-            echo "# Merged Stripe benchmark ($(jq length merged/results.json) repositories)"
+            echo "# Merged Stripe benchmark: $(jq length merged/results.json) of $(wc -l < merged/expected.txt) repositories"
             echo
-            echo "| Repository | Outcome | Pull request | Reason |"
-            echo "|---|---|---|---|"
-            cat shards/shard-*/run/summary.md | grep -E '^\| [^ ]+/[^ ]+ \|' || true
+            echo "Commit \`$COMMIT\`, list \`$LIST\`, repositories $OFFSET to $END. Images: $(paste -sd ' ' merged/images.txt)"
+            echo
+            if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+              echo "**Incomplete run.** Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt). Missing: $(paste -sd ' ' merged/missing.txt)"
+              echo
+            fi
+            echo "| Outcome class | Repositories |"
+            echo "|---|---|"
+            jq -r 'group_by(.outcomeClass // "unclassified")[] | "| \(.[0].outcomeClass // "unclassified") | \(length) |"' merged/results.json
+            echo
+            # The summary the benchmark itself writes, over every shard's rows.
+            (cd refit && npx tsx -e "import { readFileSync } from 'node:fs'; import { summaryTable } from './pipeline/stripe-benchmark.ts'; console.log(summaryTable(JSON.parse(readFileSync('../merged/results.json', 'utf8'))))")
           } > merged/summary.md
           echo "AI spend: \$$(jq '[.[] | (.workflow.aiCostUsd // 0) + (.ai.costUsd // 0)] | add // 0' merged/results.json)" >> merged/summary.md
           cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: merged
           path: merged
+      - name: Fail on missing or duplicated repositories
+        run: |
+          if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+            echo "::error::Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt) repositories; see merged/missing.txt"
+            exit 1
+          fi
