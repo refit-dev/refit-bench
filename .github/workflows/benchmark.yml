@@ -65,6 +65,10 @@ env:
 jobs:
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Recent runs' merged results fill in repository timings the cache lacks.
+      actions: read
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       plan: ${{ steps.plan.outputs.plan }}
@@ -130,6 +134,28 @@ jobs:
           path: ${{ runner.temp }}/timings
           key: refit-timings-v1-${{ github.run_id }}
           restore-keys: refit-timings-v1-
+      - name: Fill timings from recent runs
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ steps.shards.outputs.end }}
+        run: |
+          timings="$RUNNER_TEMP/timings/timings.json"
+          mkdir -p "$(dirname "$timings")"
+          [ -s "$timings" ] || echo '{}' > "$timings"
+          jq -r --argjson o "$OFFSET" --argjson e "$END" '.repos[$o:$e][].repo' "docs/benchmarks/$LIST" | sort -u > "$RUNNER_TEMP/slice.txt"
+          untimed() { comm -23 "$RUNNER_TEMP/slice.txt" <(jq -r 'keys[]' "$timings" | sort -u) | wc -l; }
+          # Newest first; a newer run's seconds, and the cached ones, win over an older run's.
+          for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=merged&per_page=50" --jq '.artifacts[] | select(.expired | not) | .workflow_run.id'); do
+            [ "$(untimed)" -gt 0 ] || break
+            rm -rf "$RUNNER_TEMP/artifact"
+            gh run download "$run" -R "$GITHUB_REPOSITORY" -n merged -D "$RUNNER_TEMP/artifact" > /dev/null 2>&1 || continue
+            jq -s '([.[1][] | select((.outcomeClass // "repository") == "repository" and (.seconds | type) == "number") | {key: .repo, value: .seconds}] | from_entries) * .[0]' \
+              "$timings" "$RUNNER_TEMP/artifact/results.json" > "$RUNNER_TEMP/timings.json" && mv "$RUNNER_TEMP/timings.json" "$timings"
+          done
+          echo "Timings for $(($(wc -l < "$RUNNER_TEMP/slice.txt") - $(untimed))) of $(wc -l < "$RUNNER_TEMP/slice.txt") repositories in the slice"
       - uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/plan
