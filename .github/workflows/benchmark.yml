@@ -22,7 +22,7 @@ on:
         required: true
         default: '1'
       count:
-        description: Repositories to run from the offset (blank runs the rest of the list)
+        description: Repositories to run from the offset; all runs the rest of the list (gh drops an empty value, which then means 5)
         required: false
         default: '5'
       ai:
@@ -33,6 +33,11 @@ on:
         description: AI cap in USD for the whole run, split evenly across shards (at most 1000, the most Refit accepts)
         required: false
         default: '2'
+      ai_scope:
+        description: With ai, what the budget pays for; patches is --ai, behaviour-tests passes --behaviour-tests without --ai
+        type: choice
+        options: [patches, behaviour-tests]
+        default: patches
       model:
         description: OpenAI model for AI patches (priced in pipeline/ai-budget.ts)
         type: choice
@@ -50,6 +55,10 @@ env:
   OASDIFF_VERSION: 1.33.0
   REFIT_DOCKER_IMAGE: node:22-alpine
   STRIPE_MOCK_IMAGE: stripe/stripe-mock:latest
+  # Saved dependency bundles per run, uncompressed, split evenly across its shards: 4 GiB compressed
+  # (zstd, about 3 to 1 on node_modules archives), under half of this repository's 10 GB Actions cache
+  # limit (Source: GET /repos/refit-dev/refit-bench/actions/cache/storage-limit, 2026-10-25).
+  DEPENDENCY_CACHE_RUN_MIB: 12288
 
 jobs:
   plan:
@@ -83,7 +92,11 @@ jobs:
           COUNT: ${{ inputs.count }}
           AI: ${{ inputs.ai }}
           AI_BUDGET: ${{ inputs.ai_budget }}
+          AI_SCOPE: ${{ inputs.ai_scope }}
         run: |
+          if [ "$COUNT" = all ]; then COUNT=''; fi
+          if ! [[ "$COUNT" =~ ^[0-9]*$ ]]; then echo "::error::count must be a whole number or all"; exit 1; fi
+          case "$AI_SCOPE" in patches | behaviour-tests) ;; *) echo "::error::ai_scope must be patches or behaviour-tests"; exit 1 ;; esac
           total=$(jq '.repos | length' "docs/benchmarks/$LIST")
           count=$((total - OFFSET))
           if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
@@ -96,7 +109,7 @@ jobs:
               echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
             fi
             echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
-            echo "AI cap: \$$AI_BUDGET for the run"
+            echo "AI cap: \$$AI_BUDGET for the run, on $AI_SCOPE"
           fi
           echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
           echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
@@ -133,6 +146,56 @@ jobs:
           docker pull -q "$REFIT_DOCKER_IMAGE"
           docker pull -q "$STRIPE_MOCK_IMAGE"
           docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" "$STRIPE_MOCK_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      # Dependency bundles are kept per shard: keyed on the image and the shard's repositories at
+      # their pinned commits, then the Refit commit; a later Refit commit restores the newest bundles
+      # of the same repositories. Refit checks every bundle's hashes and recipe before reusing it.
+      # Baseline check results are reused only by the same Refit commit.
+      - name: Cache keys
+        id: keys
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          SHARD: ${{ matrix.shard }}
+          END: ${{ needs.plan.outputs.end }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          start=$((OFFSET + SHARD * SIZE))
+          limit=$((END - start < SIZE ? END - start : SIZE))
+          repos=$(jq -c --argjson s "$start" --argjson n "$limit" '.repos[$s:$s + $n] | map([.repo, .commit])' "docs/benchmarks/$LIST" | sha256sum | cut -c1-16)
+          image=$(docker image inspect --format '{{.Id}}' "$REFIT_DOCKER_IMAGE" | cut -d: -f2 | cut -c1-12)
+          echo "dependencies=refit-dependencies-v1-$image-$repos-" >> "$GITHUB_OUTPUT"
+          echo "baseline=refit-baseline-checks-v1-$image-$repos-$COMMIT" >> "$GITHUB_OUTPUT"
+          # Files this run writes are newer than this marker; restored ones keep their saved times.
+          touch "$RUNNER_TEMP/cache-start"
+      - uses: actions/cache/restore@v4
+        id: dependencies
+        with:
+          path: ${{ runner.temp }}/dependencies
+          key: ${{ steps.keys.outputs.dependencies }}${{ inputs.commit }}
+          restore-keys: ${{ steps.keys.outputs.dependencies }}
+      - uses: actions/cache/restore@v4
+        id: baseline
+        with:
+          path: ${{ runner.temp }}/baseline-checks
+          key: ${{ steps.keys.outputs.baseline }}
+      # A restore cut short (a full disk) can leave a truncated bundle, which Refit would refuse
+      # rather than rebuild; drop any bundle whose files do not match its manifest.
+      - name: Check restored bundles
+        if: steps.dependencies.outputs.cache-matched-key != ''
+        env:
+          MATCHED: ${{ steps.dependencies.outputs.cache-matched-key }}
+        run: |
+          shopt -s nullglob
+          for key in "$RUNNER_TEMP"/dependencies/*/; do
+            if ! [ -f "$key/bundle/manifest.json" ] ||
+              ! jq -r '.files[] | "\(.sha256)  \(.path)"' "$key/bundle/manifest.json" | (cd "$key/bundle" && sha256sum --quiet --check --strict -); then
+              echo "::warning::Dropping restored dependency bundle $(basename "$key")"
+              rm -rf "$key"
+            fi
+          done
+          echo "Restored $(find "$RUNNER_TEMP/dependencies" -mindepth 1 -maxdepth 1 -type d | wc -l) dependency bundles from $MATCHED"
       - name: Run benchmark
         working-directory: refit
         env:
@@ -143,8 +206,12 @@ jobs:
           END: ${{ needs.plan.outputs.end }}
           FLAGS: ${{ inputs.flags }}
           AI: ${{ inputs.ai }}
+          AI_SCOPE: ${{ inputs.ai_scope }}
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
+          REFIT_DEPENDENCY_CACHE_DIRECTORY: ${{ runner.temp }}/dependencies
+          # Refit commits from before this setting ignore it.
+          REFIT_BASELINE_CHECK_CACHE_DIRECTORY: ${{ runner.temp }}/baseline-checks
           OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
           # The runner has 16 GB; Node's default heap ran out on SimplerDevelopment.
           NODE_OPTIONS: --max-old-space-size=8192
@@ -156,7 +223,12 @@ jobs:
             printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
               "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
             unset OPENAI_API_KEY
-            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+            # behaviour-tests spends the budget only on generated behaviour tests, never on patches.
+            if [ "$AI_SCOPE" = behaviour-tests ]; then
+              ai=(--env "$RUNNER_TEMP/ai.env" --behaviour-tests)
+            else
+              ai=(--ai --env "$RUNNER_TEMP/ai.env")
+            fi
           fi
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
@@ -170,6 +242,45 @@ jobs:
           cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
           # The AI ledger holds spend records only, never the key.
           if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+      # Saved even when the benchmark failed, without what a killed process leaves (locks, staging
+      # and unfinished bundles), within this shard's share of DEPENDENCY_CACHE_RUN_MIB (largest
+      # bundles dropped first), and only when this run built a bundle the restored cache lacked.
+      - name: Prepare caches
+        id: prepare
+        if: always() && steps.keys.outcome == 'success'
+        env:
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          EXACT: ${{ steps.dependencies.outputs.cache-hit }}
+          BASELINE_EXACT: ${{ steps.baseline.outputs.cache-hit }}
+        run: |
+          dependencies="$RUNNER_TEMP/dependencies"
+          mkdir -p "$dependencies" "$RUNNER_TEMP/baseline-checks"
+          find "$dependencies" -mindepth 2 -maxdepth 2 \( -name '*.lock' -o -name '*.lock.recovery' -o -name 'staging-*' \) -exec rm -rf {} +
+          for key in "$dependencies"/*/; do [ -f "$key/bundle/manifest.json" ] || rm -rf "$key"; done
+          budget=$((DEPENDENCY_CACHE_RUN_MIB * 1024 / $(jq length <<<"$SHARDS")))
+          while [ "$(du -sk "$dependencies" | cut -f1)" -gt "$budget" ]; do
+            largest=$(du -sk "$dependencies"/*/ | sort -n | tail -1 | cut -f2)
+            [ -n "$largest" ] || break
+            echo "Not saving $(du -sh "$largest" | cut -f1) bundle $(basename "$largest"): over this shard's $((budget / 1024)) MiB"
+            rm -rf "$largest"
+          done
+          built=$(find "$dependencies" -mindepth 3 -maxdepth 3 -path '*/bundle/manifest.json' -newer "$RUNNER_TEMP/cache-start" | wc -l)
+          echo "Dependency bundles: $(find "$dependencies" -mindepth 1 -maxdepth 1 -type d | wc -l) kept, $built built in this run, $(du -sh "$dependencies" | cut -f1)"
+          echo "dependencies=$([ "$EXACT" != true ] && [ "$built" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          find "$RUNNER_TEMP/baseline-checks" -type f ! -name '*.json' -delete
+          results=$(find "$RUNNER_TEMP/baseline-checks" -type f | wc -l)
+          echo "Baseline check results: $results"
+          echo "baseline=$([ "$BASELINE_EXACT" != true ] && [ "$results" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: always() && steps.prepare.outputs.dependencies == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dependencies
+          key: ${{ steps.keys.outputs.dependencies }}${{ inputs.commit }}
+      - if: always() && steps.prepare.outputs.baseline == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/baseline-checks
+          key: ${{ steps.keys.outputs.baseline }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -207,6 +318,12 @@ jobs:
           END: ${{ needs.plan.outputs.end }}
           COMMIT: ${{ inputs.commit }}
         run: |
+          # Refit commits with the merge script use it; it writes the same files as the steps below.
+          if [ -f refit/scripts/benchmark-merge.mjs ]; then
+            node refit/scripts/benchmark-merge.mjs --shards shards --list "$LIST" --offset "$OFFSET" --end "$END" --commit "$COMMIT" --output merged
+            cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           mkdir merged
           shopt -s nullglob
           files=(shards/shard-*/run/results.json)
