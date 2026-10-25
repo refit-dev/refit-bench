@@ -55,9 +55,10 @@ env:
   OASDIFF_VERSION: 1.33.0
   REFIT_DOCKER_IMAGE: node:22-alpine
   STRIPE_MOCK_IMAGE: stripe/stripe-mock:latest
-  # Saved dependency bundles per run, uncompressed, split evenly across its shards: 4 GiB compressed
-  # (zstd, about 3 to 1 on node_modules archives), under half of this repository's 10 GB Actions cache
-  # limit (Source: GET /repos/refit-dev/refit-bench/actions/cache/storage-limit, 2026-10-25).
+  # Saved dependency bundles per run, uncompressed, split evenly across its shards. zstd shrinks these
+  # archives about 4.7 times (run 40166506002: 7,664 MiB to 1,638 MiB), so a run saves about 2.6 GB,
+  # well under this repository's 10 GB Actions cache limit (Source: GET
+  # /repos/refit-dev/refit-bench/actions/cache/storage-limit, 2026-10-25).
   DEPENDENCY_CACHE_RUN_MIB: 12288
   # No shard restores more than this, so a run of one or two shards keeps its runner's disk free.
   DEPENDENCY_CACHE_SHARD_MIB: 4096
