@@ -22,7 +22,7 @@ on:
         required: true
         default: '1'
       count:
-        description: Repositories to run from the offset (blank runs the rest of the list)
+        description: Repositories to run from the offset; all runs the rest of the list (gh drops an empty value, which then means 5)
         required: false
         default: '5'
       ai:
@@ -33,6 +33,11 @@ on:
         description: AI cap in USD for the whole run, split evenly across shards (at most 1000, the most Refit accepts)
         required: false
         default: '2'
+      ai_scope:
+        description: With ai, what the budget pays for; patches is --ai, behaviour-tests passes --behaviour-tests without --ai
+        type: choice
+        options: [patches, behaviour-tests]
+        default: patches
       model:
         description: OpenAI model for AI patches (priced in pipeline/ai-budget.ts)
         type: choice
@@ -50,12 +55,24 @@ env:
   OASDIFF_VERSION: 1.33.0
   REFIT_DOCKER_IMAGE: node:22-alpine
   STRIPE_MOCK_IMAGE: stripe/stripe-mock:latest
+  # Saved dependency bundles per run, uncompressed, split evenly across its shards. zstd shrinks these
+  # archives about 4.7 times (run 40166506002: 7,664 MiB to 1,638 MiB), so a run saves about 2.6 GB,
+  # well under this repository's 10 GB Actions cache limit (Source: GET
+  # /repos/refit-dev/refit-bench/actions/cache/storage-limit, 2026-10-25).
+  DEPENDENCY_CACHE_RUN_MIB: 12288
+  # No shard restores more than this, so a run of one or two shards keeps its runner's disk free.
+  DEPENDENCY_CACHE_SHARD_MIB: 4096
 
 jobs:
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Recent runs' merged results fill in repository timings the cache lacks.
+      actions: read
     outputs:
-      shards: ${{ steps.shards.outputs.shards }}
+      shards: ${{ steps.plan.outputs.shards }}
+      plan: ${{ steps.plan.outputs.plan }}
       end: ${{ steps.shards.outputs.end }}
       shard_budget: ${{ steps.shards.outputs.shard_budget }}
     steps:
@@ -65,6 +82,11 @@ jobs:
           ref: ${{ inputs.commit }}
           token: ${{ secrets.REFIT_READ_TOKEN }}
           sparse-checkout: docs/benchmarks
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: bench
+          sparse-checkout: .github/scripts
           persist-credentials: false
       # One shard per `size` repositories; GitHub caps a matrix at 256 jobs.
       - name: Check flags
@@ -83,7 +105,11 @@ jobs:
           COUNT: ${{ inputs.count }}
           AI: ${{ inputs.ai }}
           AI_BUDGET: ${{ inputs.ai_budget }}
+          AI_SCOPE: ${{ inputs.ai_scope }}
         run: |
+          if [ "$COUNT" = all ]; then COUNT=''; fi
+          if ! [[ "$COUNT" =~ ^[0-9]*$ ]]; then echo "::error::count must be a whole number or all"; exit 1; fi
+          case "$AI_SCOPE" in patches | behaviour-tests) ;; *) echo "::error::ai_scope must be patches or behaviour-tests"; exit 1 ;; esac
           total=$(jq '.repos | length' "docs/benchmarks/$LIST")
           count=$((total - OFFSET))
           if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
@@ -96,10 +122,72 @@ jobs:
               echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
             fi
             echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
-            echo "AI cap: \$$AI_BUDGET for the run"
+            echo "AI cap: \$$AI_BUDGET for the run, on $AI_SCOPE"
           fi
           echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
-          echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+          echo "slice=$(sha256sum "docs/benchmarks/$LIST" | cut -c1-16)-$OFFSET-$((OFFSET + count))-$SIZE" >> "$GITHUB_OUTPUT"
+      # Shards are balanced by each repository's newest seconds from earlier runs of any list when at
+      # least half of the slice has one, and are contiguous slices as before otherwise. A balanced plan
+      # is reused for the same list slice for a day, so reruns and nearby commits get the same shards,
+      # and with them the same per-shard caches.
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/timings
+          key: refit-timings-v1-${{ github.run_id }}
+          restore-keys: refit-timings-v1-
+      - name: Fill timings from recent runs
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ steps.shards.outputs.end }}
+        run: |
+          timings="$RUNNER_TEMP/timings/timings.json"
+          mkdir -p "$(dirname "$timings")"
+          [ -s "$timings" ] || echo '{}' > "$timings"
+          jq -r --argjson o "$OFFSET" --argjson e "$END" '.repos[$o:$e][].repo' "docs/benchmarks/$LIST" | sort -u > "$RUNNER_TEMP/slice.txt"
+          untimed() { comm -23 "$RUNNER_TEMP/slice.txt" <(jq -r 'keys[]' "$timings" | sort -u) | wc -l; }
+          # Newest first; a newer run's seconds, and the cached ones, win over an older run's.
+          for run in $(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=merged&per_page=50" --jq '.artifacts[] | select(.expired | not) | .workflow_run.id'); do
+            [ "$(untimed)" -gt 0 ] || break
+            rm -rf "$RUNNER_TEMP/artifact"
+            gh run download "$run" -R "$GITHUB_REPOSITORY" -n merged -D "$RUNNER_TEMP/artifact" > /dev/null 2>&1 || continue
+            jq -s '([.[1][] | select((.outcomeClass // "repository") == "repository" and (.seconds | type) == "number") | {key: .repo, value: .seconds}] | from_entries) * .[0]' \
+              "$timings" "$RUNNER_TEMP/artifact/results.json" > "$RUNNER_TEMP/timings.json" && mv "$RUNNER_TEMP/timings.json" "$timings"
+          done
+          echo "Timings for $(($(wc -l < "$RUNNER_TEMP/slice.txt") - $(untimed))) of $(wc -l < "$RUNNER_TEMP/slice.txt") repositories in the slice"
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/plan
+          key: refit-plan-v1-${{ steps.shards.outputs.slice }}-${{ github.run_id }}
+          restore-keys: refit-plan-v1-${{ steps.shards.outputs.slice }}-
+      - name: Plan shards
+        id: plan
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          END: ${{ steps.shards.outputs.end }}
+        run: |
+          if ! plan=$(node bench/.github/scripts/plan-shards.mjs --list "docs/benchmarks/$LIST" --offset "$OFFSET" --end "$END" --size "$SIZE" \
+            --timings "$RUNNER_TEMP/timings/timings.json" --previous "$RUNNER_TEMP/plan/plan.json"); then
+            echo "::warning::The shard planner failed; the shards are contiguous slices."
+            plan=$(jq -cn --argjson o "$OFFSET" --argjson e "$END" --argjson z "$SIZE" '{mode: "contiguous", shards: [range($o; $e; $z) as $s | [range($s; [$s + $z, $e] | min)]]}')
+          fi
+          jq -r '"Shard plan: \(.mode)" + if .estimates then ", estimated \(.estimates | min) to \(.estimates | max) seconds per shard" else "" end' <<<"$plan"
+          echo "plan=$(jq -c .shards <<<"$plan")" >> "$GITHUB_OUTPUT"
+          echo "shards=$(jq -c '[range(.shards | length)]' <<<"$plan")" >> "$GITHUB_OUTPUT"
+          if [ "$(jq -r .mode <<<"$plan")" = balanced ]; then
+            mkdir -p "$RUNNER_TEMP/plan" && echo "$plan" > "$RUNNER_TEMP/plan/plan.json"
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.plan.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/plan
+          key: refit-plan-v1-${{ steps.shards.outputs.slice }}-${{ github.run_id }}
 
   shard:
     needs: plan
@@ -133,18 +221,74 @@ jobs:
           docker pull -q "$REFIT_DOCKER_IMAGE"
           docker pull -q "$STRIPE_MOCK_IMAGE"
           docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" "$STRIPE_MOCK_IMAGE" | tee "$RUNNER_TEMP/images.txt"
-      - name: Run benchmark
+      - name: Shard list
         working-directory: refit
         env:
           LIST: ${{ inputs.list }}
-          OFFSET: ${{ inputs.offset }}
-          SIZE: ${{ inputs.size }}
-          SHARD: ${{ matrix.shard }}
-          END: ${{ needs.plan.outputs.end }}
+          INDEXES: ${{ toJSON(fromJSON(needs.plan.outputs.plan)[matrix.shard]) }}
+        run: |
+          jq --argjson indexes "$INDEXES" '.repos |= [.[$indexes[]]]' "docs/benchmarks/$LIST" > "$RUNNER_TEMP/shard-list.json"
+          echo "List entries $(jq -c . <<<"$INDEXES"): $(jq '.repos | length' "$RUNNER_TEMP/shard-list.json") repositories"
+      # Dependency bundles are kept per shard: keyed on the image and the shard's repositories at
+      # their pinned commits, then the Refit commit; a later Refit commit restores the newest bundles
+      # of the same repositories. Refit checks every bundle's hashes and recipe before reusing it.
+      # Baseline check results are reused only by the same Refit commit.
+      - name: Cache keys
+        id: keys
+        # Without keys the shard skips both caches and runs as before.
+        continue-on-error: true
+        env:
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          repos=$(jq -c '.repos | map([.repo, .commit])' "$RUNNER_TEMP/shard-list.json" | sha256sum | cut -c1-16)
+          image=$(docker image inspect --format '{{.Id}}' "$REFIT_DOCKER_IMAGE" | cut -d: -f2 | cut -c1-12)
+          echo "dependencies=refit-dependencies-v1-$image-$repos-" >> "$GITHUB_OUTPUT"
+          echo "baseline=refit-baseline-checks-v1-$image-$repos-$COMMIT" >> "$GITHUB_OUTPUT"
+          # Files this run writes are newer than this marker; restored ones keep their saved times.
+          touch "$RUNNER_TEMP/cache-start"
+      - uses: actions/cache/restore@v4
+        id: dependencies
+        if: steps.keys.outcome == 'success'
+        with:
+          path: ${{ runner.temp }}/dependencies
+          key: ${{ steps.keys.outputs.dependencies }}${{ inputs.commit }}
+          restore-keys: ${{ steps.keys.outputs.dependencies }}
+      - uses: actions/cache/restore@v4
+        id: baseline
+        if: steps.keys.outcome == 'success'
+        with:
+          path: ${{ runner.temp }}/baseline-checks
+          key: ${{ steps.keys.outputs.baseline }}
+      # A restore cut short (a full disk) can leave a truncated bundle, which Refit would refuse
+      # rather than rebuild; drop any bundle whose files do not match its manifest.
+      - name: Check restored bundles
+        if: steps.dependencies.outputs.cache-matched-key != ''
+        continue-on-error: true
+        env:
+          MATCHED: ${{ steps.dependencies.outputs.cache-matched-key }}
+        run: |
+          # Anything unexpected discards the whole restore: the shard then runs cold.
+          trap 'rm -rf "$RUNNER_TEMP/dependencies"' ERR
+          shopt -s nullglob
+          for key in "$RUNNER_TEMP"/dependencies/*/; do
+            if ! [ -f "$key/bundle/manifest.json" ] ||
+              ! jq -r '.files[] | "\(.sha256)  \(.path)"' "$key/bundle/manifest.json" | (cd "$key/bundle" && sha256sum --quiet --check --strict -); then
+              echo "::warning::Dropping restored dependency bundle $(basename "$key")"
+              rm -rf "$key"
+            fi
+          done
+          echo "Restored $(find "$RUNNER_TEMP/dependencies" -mindepth 1 -maxdepth 1 -type d | wc -l) dependency bundles from $MATCHED"
+      - name: Run benchmark
+        working-directory: refit
+        env:
           FLAGS: ${{ inputs.flags }}
           AI: ${{ inputs.ai }}
+          AI_SCOPE: ${{ inputs.ai_scope }}
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
+          REFIT_DEPENDENCY_CACHE_DIRECTORY: ${{ runner.temp }}/dependencies
+          # Refit commits from before this setting ignore it.
+          REFIT_BASELINE_CHECK_CACHE_DIRECTORY: ${{ runner.temp }}/baseline-checks
           OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
           # The runner has 16 GB; Node's default heap ran out on SimplerDevelopment.
           NODE_OPTIONS: --max-old-space-size=8192
@@ -156,13 +300,16 @@ jobs:
             printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
               "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
             unset OPENAI_API_KEY
-            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+            # behaviour-tests spends the budget only on generated behaviour tests, never on patches.
+            if [ "$AI_SCOPE" = behaviour-tests ]; then
+              ai=(--env "$RUNNER_TEMP/ai.env" --behaviour-tests)
+            else
+              ai=(--ai --env "$RUNNER_TEMP/ai.env")
+            fi
           fi
-          start=$((OFFSET + SHARD * SIZE))
-          limit=$((END - start < SIZE ? END - start : SIZE))
           # A repository that no longer clones (deleted or private) must not cost the shard its other
           # rows: setup still writes selected.json, and the benchmark records it as a clone failure.
-          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit" \
+          node scripts/stripe-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/shard-list.json" --offset 0 --limit "$(jq '.repos | length' "$RUNNER_TEMP/shard-list.json")" \
             || echo "::warning::Setup could not clone every repository; the benchmark records each as a clone failure."
           mkdir -p "$RUNNER_TEMP/out"
           npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
@@ -170,6 +317,48 @@ jobs:
           cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
           # The AI ledger holds spend records only, never the key.
           if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+      # Saved even when the benchmark failed, without what a killed process leaves (locks, staging
+      # and unfinished bundles), within this shard's share of DEPENDENCY_CACHE_RUN_MIB and at most
+      # DEPENDENCY_CACHE_SHARD_MIB (largest bundles dropped first), and only when this run built a
+      # bundle the restored cache lacked.
+      - name: Prepare caches
+        id: prepare
+        if: always() && steps.keys.outcome == 'success'
+        continue-on-error: true
+        env:
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          EXACT: ${{ steps.dependencies.outputs.cache-hit }}
+          BASELINE_EXACT: ${{ steps.baseline.outputs.cache-hit }}
+        run: |
+          dependencies="$RUNNER_TEMP/dependencies"
+          mkdir -p "$dependencies" "$RUNNER_TEMP/baseline-checks"
+          find "$dependencies" -mindepth 2 -maxdepth 2 \( -name '*.lock' -o -name '*.lock.recovery' -o -name 'staging-*' \) -exec rm -rf {} +
+          for key in "$dependencies"/*/; do [ -f "$key/bundle/manifest.json" ] || rm -rf "$key"; done
+          budget=$((DEPENDENCY_CACHE_RUN_MIB * 1024 / $(jq length <<<"$SHARDS")))
+          budget=$((budget < DEPENDENCY_CACHE_SHARD_MIB * 1024 ? budget : DEPENDENCY_CACHE_SHARD_MIB * 1024))
+          while [ "$(du -sk "$dependencies" | cut -f1)" -gt "$budget" ]; do
+            largest=$(du -sk "$dependencies"/*/ | sort -n | tail -1 | cut -f2)
+            [ -n "$largest" ] || break
+            echo "Not saving $(du -sh "$largest" | cut -f1) bundle $(basename "$largest"): over this shard's $((budget / 1024)) MiB"
+            rm -rf "$largest"
+          done
+          built=$(find "$dependencies" -mindepth 3 -maxdepth 3 -path '*/bundle/manifest.json' -newer "$RUNNER_TEMP/cache-start" | wc -l)
+          echo "Dependency bundles: $(find "$dependencies" -mindepth 1 -maxdepth 1 -type d | wc -l) kept, $built built in this run, $(du -sh "$dependencies" | cut -f1); disk: $(df -h --output=avail "$RUNNER_TEMP" | tail -1) free"
+          echo "dependencies=$([ "$EXACT" != true ] && [ "$built" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          find "$RUNNER_TEMP/baseline-checks" -type f ! -name '*.json' -delete
+          results=$(find "$RUNNER_TEMP/baseline-checks" -type f | wc -l)
+          echo "Baseline check results: $results"
+          echo "baseline=$([ "$BASELINE_EXACT" != true ] && [ "$results" -gt 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - if: always() && steps.prepare.outputs.dependencies == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/dependencies
+          key: ${{ steps.keys.outputs.dependencies }}${{ inputs.commit }}
+      - if: always() && steps.prepare.outputs.baseline == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/baseline-checks
+          key: ${{ steps.keys.outputs.baseline }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -207,6 +396,12 @@ jobs:
           END: ${{ needs.plan.outputs.end }}
           COMMIT: ${{ inputs.commit }}
         run: |
+          # Refit commits with the merge script use it; it writes the same files as the steps below.
+          if [ -f refit/scripts/benchmark-merge.mjs ]; then
+            node refit/scripts/benchmark-merge.mjs --shards shards --list "$LIST" --offset "$OFFSET" --end "$END" --commit "$COMMIT" --output merged
+            cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           mkdir merged
           shopt -s nullglob
           files=(shards/shard-*/run/results.json)
@@ -241,6 +436,33 @@ jobs:
         with:
           name: merged
           path: merged
+      # Each repository's newest seconds, which the next run's plan job balances shards by. AI runs
+      # take longer per repository, so they do not update them.
+      - uses: actions/cache/restore@v4
+        if: always() && !inputs.ai
+        with:
+          path: ${{ runner.temp }}/timings
+          key: refit-timings-v1-${{ github.run_id }}
+          restore-keys: refit-timings-v1-
+      - name: Update repository timings
+        id: timings
+        if: always() && !inputs.ai
+        continue-on-error: true
+        run: |
+          timings="$RUNNER_TEMP/timings/timings.json"
+          mkdir -p "$(dirname "$timings")"
+          [ -s "$timings" ] || echo '{}' > "$timings"
+          # Infrastructure errors (a failed clone) say nothing about how long a repository takes.
+          jq -s '.[0] * ([.[1][] | select((.outcomeClass // "repository") == "repository" and (.seconds | type) == "number") | {key: .repo, value: .seconds}] | from_entries)' \
+            "$timings" merged/results.json > "$RUNNER_TEMP/timings.json"
+          mv "$RUNNER_TEMP/timings.json" "$timings"
+          echo "Timings for $(jq length "$timings") repositories"
+      - if: always() && !inputs.ai && steps.timings.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/timings
+          key: refit-timings-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Fail on missing or duplicated repositories
         run: |
           if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
