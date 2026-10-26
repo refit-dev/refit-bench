@@ -1,0 +1,271 @@
+name: Shopify benchmark
+
+# Runs the Refit Shopify benchmark on GitHub-hosted runners, one job per shard. No secret but
+# REFIT_READ_TOKEN: the `snapshots` job reads the Admin API schemas once from Shopify's public
+# documentation proxy (no store, no credentials) and every shard uses those saved bytes.
+# Logs and artifacts of this public repository are public.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to benchmark
+        required: true
+        default: 705b138af028aa78f1aba51fcab4cc7e0de02ae3
+      list:
+        description: Frozen Shopify repository list under docs/benchmarks
+        required: true
+        default: 2026-10-16-shopify-fresh-repos.json
+      offset:
+        description: First repository of the first shard
+        required: true
+        default: '0'
+      size:
+        description: Repositories per shard
+        required: true
+        default: '1'
+      count:
+        description: Repositories to run from the offset (blank runs the rest of the list)
+        required: false
+        default: '5'
+      contracts:
+        description: pinned stops unless Shopify still serves the frozen list's schemas; current uses today's and records their hashes
+        type: choice
+        options: [current, pinned]
+        default: current
+      flags:
+        description: Extra benchmark:shopify flags, such as --sdk-upgrade
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  REFIT_DOCKER_IMAGE: node:22-alpine
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+      end: ${{ steps.shards.outputs.end }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          persist-credentials: false
+      - name: Check flags
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(root|output|list|limit|resume)[\ =] ]]; then
+            echo "::error::flags may hold only plain options, and never --root, --output, --list, --limit or --resume"
+            exit 1
+          fi
+      # One shard per `size` repositories; GitHub caps a matrix at 256 jobs.
+      - id: shards
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          COUNT: ${{ inputs.count }}
+        run: |
+          total=$(jq '.repos | length' "docs/benchmarks/$LIST")
+          count=$((total - OFFSET))
+          if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
+          if [ "$count" -le 0 ]; then echo "::error::Offset $OFFSET is past the list's $total repositories"; exit 1; fi
+          shards=$(((count + SIZE - 1) / SIZE))
+          if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
+          echo "$count repositories in $shards shards"
+          echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+
+  # Shopify changes published schemas in place (both frozen lists drifted within a week), so each
+  # run reads them once and every shard validates the same bytes.
+  snapshots:
+    runs-on: ubuntu-latest
+    outputs:
+      schemas: ${{ steps.read.outputs.schemas }}
+      drift: ${{ steps.read.outputs.drift }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - id: read
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          CONTRACTS: ${{ inputs.contracts }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/snapshots"
+          for version in $(jq -r '.schemas.versions[].version' "docs/benchmarks/$LIST"); do
+            node bin/refit.mjs shopify-snapshot --version "$version" --output "$RUNNER_TEMP/snapshots/$version.json"
+          done
+          schemas=$(jq -c -n '[inputs | {version, sha256: .hash}]' "$RUNNER_TEMP"/snapshots/*.json)
+          drift=$(jq -r --argjson read "$schemas" '[.schemas.versions[] as $p | $read[] | select(.version == $p.version and .sha256 != $p.sha256) | .version] | join(" ")' "docs/benchmarks/$LIST")
+          echo "$schemas" > "$RUNNER_TEMP/snapshots/schemas.json"
+          echo "schemas=$schemas" >> "$GITHUB_OUTPUT"
+          echo "drift=$drift" >> "$GITHUB_OUTPUT"
+          if [ -n "$drift" ]; then
+            if [ "$CONTRACTS" = pinned ]; then echo "::error::Shopify no longer serves the frozen schemas for $drift; dispatch with contracts=current"; exit 1; fi
+            echo "::warning::Shopify changed $drift since the list was frozen; this run uses the schemas read now"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshots
+          path: ${{ runner.temp }}/snapshots
+          retention-days: 7
+
+  shard:
+    needs: [plan, snapshots]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - uses: actions/download-artifact@v4
+        with:
+          name: snapshots
+          path: ${{ runner.temp }}/root/snapshots
+      # Refit never pulls images itself.
+      - run: |
+          docker pull -q "$REFIT_DOCKER_IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      - name: Run benchmark
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          SHARD: ${{ matrix.shard }}
+          END: ${{ needs.plan.outputs.end }}
+          FLAGS: ${{ inputs.flags }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          start=$((OFFSET + SHARD * SIZE))
+          limit=$((END - start < SIZE ? END - start : SIZE))
+          # The list's schema hashes become those of the snapshots job, so setup reuses its saved
+          # files and checks their SHA-256 instead of reading Shopify again.
+          jq --slurpfile read "$RUNNER_TEMP/root/snapshots/schemas.json" '.schemas.versions = $read[0]' "docs/benchmarks/$LIST" > "$RUNNER_TEMP/list.json"
+          # Setup writes the shard's part of the list to <root>/list.json. A repository that no longer
+          # clones must not cost the shard its other rows; the benchmark records it as a clone failure.
+          node scripts/shopify-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/list.json" --offset "$start" --limit "$limit" \
+            || echo "::warning::Setup could not clone every repository; the benchmark records each as a clone failure."
+          # Setup also exits 1 on a schema that does not match its hash; check them again here.
+          jq -r '.[] | "\(.version) \(.sha256)"' "$RUNNER_TEMP/root/snapshots/schemas.json" | while read -r version sha256; do
+            actual=$(jq -j .content "$RUNNER_TEMP/root/snapshots/$version.json" | sha256sum | cut -d' ' -f1)
+            if [ "$actual" != "$sha256" ]; then echo "::error::Shopify $version snapshot is not $sha256"; exit 1; fi
+          done
+          mkdir -p "$RUNNER_TEMP/out"
+          npm run benchmark:shopify -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate $FLAGS
+          cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, snapshots, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          path: refit
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Merge shard results
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ needs.plan.outputs.end }}
+          COMMIT: ${{ inputs.commit }}
+          SCHEMAS: ${{ needs.snapshots.outputs.schemas }}
+          DRIFT: ${{ needs.snapshots.outputs.drift }}
+        run: |
+          mkdir merged
+          echo "$SCHEMAS" > merged/schemas.json
+          shopt -s nullglob
+          files=(shards/shard-*/run/results.json)
+          if [ ${#files[@]} -gt 0 ]; then jq -s add "${files[@]}" > merged/results.json; else echo '[]' > merged/results.json; fi
+          # Every repository the plan assigned must have exactly one row.
+          jq -r --argjson offset "$OFFSET" --argjson end "$END" '.repos[$offset:$end][].repo' "refit/docs/benchmarks/$LIST" | sort > merged/expected.txt
+          jq -r '.[].repo' merged/results.json | sort > merged/present.txt
+          comm -23 merged/expected.txt <(sort -u merged/present.txt) > merged/missing.txt
+          comm -13 merged/expected.txt <(sort -u merged/present.txt) > merged/unexpected.txt
+          uniq -d merged/present.txt > merged/duplicated.txt
+          cat shards/shard-*/images.txt 2>/dev/null | sort -u > merged/images.txt || true
+          {
+            echo "# Merged Shopify benchmark: $(jq length merged/results.json) of $(wc -l < merged/expected.txt) repositories"
+            echo
+            echo "Commit \`$COMMIT\`, list \`$LIST\`, repositories $OFFSET to $END. Images: $(paste -sd ' ' merged/images.txt)"
+            echo
+            echo "Admin schemas read $(date -u +%F): $(jq -r 'map("\(.version) \(.sha256[0:12])") | join(", ")' merged/schemas.json)"
+            echo
+            if [ -n "$DRIFT" ]; then
+              echo "**Contracts differ from the frozen list** for $DRIFT; compare only with runs on the same schema hashes."
+              echo
+            fi
+            if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+              echo "**Incomplete run.** Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt). Missing: $(paste -sd ' ' merged/missing.txt)"
+              echo
+            fi
+            echo "| Outcome class | Repositories |"
+            echo "|---|---|"
+            jq -r 'group_by(.outcomeClass // "unclassified")[] | "| \(.[0].outcomeClass // "unclassified") | \(length) |"' merged/results.json
+            echo
+            echo "| Workflow status | Repositories |"
+            echo "|---|---|"
+            jq -r 'group_by(.workflow.status // "not run")[] | "| \(.[0].workflow.status // "not run") | \(length) |"' merged/results.json
+          } > merged/summary.md
+          cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merged
+          path: merged
+      - name: Fail on missing or duplicated repositories
+        run: |
+          if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+            echo "::error::Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt) repositories; see merged/missing.txt"
+            exit 1
+          fi
