@@ -14,6 +14,11 @@ on:
         description: Space-separated Stripe releases with a catalog under docs/benchmarks/stripe-changelog/catalog
         required: true
         default: 2025-03-31.basil 2025-09-30.clover 2026-03-25.dahlia 2026-09-30.endive
+      statements:
+        description: "Change statements: none sends the changelog pages only and the model lists the changes; catalog also sends the catalog's statements (an upper bound)"
+        type: choice
+        options: [none, catalog]
+        default: none
       ai_budget:
         description: AI cap in USD for the whole run (at most 3)
         required: true
@@ -69,6 +74,7 @@ jobs:
           RELEASES: ${{ inputs.releases }}
           AI_BUDGET: ${{ inputs.ai_budget }}
           MODEL: ${{ inputs.model }}
+          STATEMENTS: ${{ inputs.statements }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
@@ -80,7 +86,7 @@ jobs:
           for release in $RELEASES; do releases+=(--release "$release"); done
           mkdir -p "$RUNNER_TEMP/out"
           status=0
-          node bin/refit.mjs classify-release "${releases[@]}" --output "$RUNNER_TEMP/out/classification" --env "$RUNNER_TEMP/ai.env" || status=$?
+          node bin/refit.mjs classify-release "${releases[@]}" --statements "$STATEMENTS" --output "$RUNNER_TEMP/out/classification" --env "$RUNNER_TEMP/ai.env" || status=$?
           rm -f "$RUNNER_TEMP/ai.env"
           # The AI ledger holds spend records only, never the key.
           if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
@@ -89,11 +95,11 @@ jobs:
         run: |
           results="$RUNNER_TEMP/out/classification/results.json"
           {
-            echo "# Release classification: $(jq -r '.releases | join(", ")' "$results")"
+            echo "# Release classification: $(jq -r '.releases | join(", ")' "$results"), statements from $(jq -r .statements "$results")"
             echo
             echo "Commit \`$(jq -r .commit "$results")\`, model \`$(jq -r '.reportedModels | join(", ")' "$results")\`, spend \$$(jq .costUsd "$results") of \$$(jq .budgetUsd "$results")"
             echo
-            jq -r '.summary | "Handling \(.handlingCorrect)/\(.changes), page category \(.pageCategoryCorrect)/\(.pages), family \(.familyImpliedCorrect)/\(.familyImplied), dangerous \(.dangerous), unclassified \(.changes - .changesClassified)"' "$results"
+            jq -r '.summary | "Handling \(.handlingCorrect)/\(.changes), page category \(.pageCategoryCorrect)/\(.pages), family \(.familyImpliedCorrect)/\(.familyImplied), dangerous \(.dangerous), unmatched \(.changes - .changesClassified), extra \(.extraStatements)"' "$results"
           } >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         uses: actions/upload-artifact@v4
