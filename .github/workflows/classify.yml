@@ -1,0 +1,103 @@
+name: Release classification
+
+# Runs `refit classify-release`: OpenAI classifies each breaking change on the saved Stripe
+# changelog pages of the chosen releases, scored against Refit's hand catalog. Always spends the
+# OPENAI_API_KEY secret's budget, capped by ai_budget for the whole run.
+# Logs and artifacts of this public repository are public; secrets go only through repository secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to run
+        required: true
+      releases:
+        description: Space-separated Stripe releases with a catalog under docs/benchmarks/stripe-changelog/catalog
+        required: true
+        default: 2025-03-31.basil 2025-09-30.clover 2026-03-25.dahlia 2026-09-30.endive
+      ai_budget:
+        description: AI cap in USD for the whole run (at most 3)
+        required: true
+        default: '3'
+      model:
+        description: OpenAI model (priced in pipeline/ai-budget.ts)
+        type: choice
+        options: [gpt-5.6-luna, gpt-6.1-sol]
+        default: gpt-5.6-luna
+
+permissions:
+  contents: read
+
+env:
+  MAX_AI_BUDGET_USD: 3
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check inputs
+        env:
+          COMMIT: ${{ inputs.commit }}
+          RELEASES: ${{ inputs.releases }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+        run: |
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::commit must be a full 40-character SHA"; exit 1; fi
+          if ! [[ "$RELEASES" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}\.[a-z]+(\ [0-9]{4}-[0-9]{2}-[0-9]{2}\.[a-z]+)*$ ]]; then
+            echo "::error::releases must be space-separated versions such as 2026-09-30.endive"; exit 1
+          fi
+          if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" -v m="$MAX_AI_BUDGET_USD" 'BEGIN { exit !(b > 0 && b <= m) }'; then
+            echo "::error::ai_budget must be a number above 0 and at most $MAX_AI_BUDGET_USD"; exit 1
+          fi
+          echo "AI cap: \$$AI_BUDGET for the run"
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - name: Classify releases
+        working-directory: refit
+        env:
+          RELEASES: ${{ inputs.releases }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+          MODEL: ${{ inputs.model }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+          # One ledger for every release; the run's total is ai_budget.
+          printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+            "$OPENAI_API_KEY" "$MODEL" "$AI_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+          unset OPENAI_API_KEY
+          releases=()
+          for release in $RELEASES; do releases+=(--release "$release"); done
+          mkdir -p "$RUNNER_TEMP/out"
+          status=0
+          node bin/refit.mjs classify-release "${releases[@]}" --output "$RUNNER_TEMP/out/classification" --env "$RUNNER_TEMP/ai.env" || status=$?
+          rm -f "$RUNNER_TEMP/ai.env"
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+          exit $status
+      - name: Summarize
+        run: |
+          results="$RUNNER_TEMP/out/classification/results.json"
+          {
+            echo "# Release classification: $(jq -r '.releases | join(", ")' "$results")"
+            echo
+            echo "Commit \`$(jq -r .commit "$results")\`, model \`$(jq -r '.reportedModels | join(", ")' "$results")\`, spend \$$(jq .costUsd "$results") of \$$(jq .budgetUsd "$results")"
+            echo
+            jq -r '.summary | "Handling \(.handlingCorrect)/\(.changes), page category \(.pageCategoryCorrect)/\(.pages), family \(.familyImpliedCorrect)/\(.familyImplied), dangerous \(.dangerous), unclassified \(.changes - .changesClassified)"' "$results"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: classification
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
