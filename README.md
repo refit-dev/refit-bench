@@ -10,6 +10,14 @@ gh run download <run-id> -R refit-dev/refit-bench -D <dir>
 gh run download <run-id> -R refit-dev/refit-bench -n merged -D <dir>   # results.json, summary.md, missing.txt
 ```
 
+`shopify.yml` runs the Shopify benchmark the same way, without AI or secrets beyond `REFIT_READ_TOKEN`. Its `snapshots` job reads the Admin API schemas once from Shopify's public documentation proxy and every shard validates those saved bytes. Shopify changes published schemas in place, so `contracts=current` (the default) uses today's and flags the drift in the summary; `contracts=pinned` stops unless Shopify still serves the frozen list's hashes.
+
+```sh
+gh workflow run shopify.yml -R refit-dev/refit-bench \
+  -f commit=<full 40-character Refit SHA> \
+  -f list=2026-10-16-shopify-fresh-repos.json -f offset=0 -f count=50 -f size=5
+```
+
 Logs and artifacts here are public. Secrets: `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository, and `OPENAI_API_KEY`, the owner's capped key, used only by AI runs. Never pass a key through an input.
 
 The `merge` job checks that every repository the plan assigned has exactly one row. A shard that failed at setup shows up in `merged/missing.txt` and in the summary's first lines, and the job fails, so an incomplete run cannot pass for a complete one. Shards pull `node:22-alpine` and `stripe/stripe-mock:latest` (generated checks need it; Refit never pulls images itself), and `merged/images.txt` records the digests used.
