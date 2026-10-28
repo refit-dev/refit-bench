@@ -1,0 +1,98 @@
+name: Stripe rules
+
+# Runs Refit's `rules generate` (docs/MINED-RULES.md) for pinned Stripe API versions with the
+# OPENAI_API_KEY secret, then `rules check` on the committed tables, and uploads results.json and
+# audit.json. It never writes to Refit: a person compares the results with data/rules/stripe.
+# Logs and artifacts of this public repository are public; secrets go only through repository secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to run
+        required: true
+      versions:
+        description: Space-separated pinned API versions (blank = every version after the first pinned one)
+        required: false
+        default: ''
+      ai_budget:
+        description: AI cap in USD (at most 5)
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+env:
+  MAX_AI_BUDGET_USD: 5
+  MODEL: gpt-6.1-sol
+  OASDIFF_VERSION: 1.33.0
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check inputs
+        env:
+          COMMIT: ${{ inputs.commit }}
+          VERSIONS: ${{ inputs.versions }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+        run: |
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::commit must be a full 40-character SHA"; exit 1; fi
+          if ! [[ "$VERSIONS" =~ ^[0-9a-z.\ -]*$ ]]; then echo "::error::versions must be pinned API versions"; exit 1; fi
+          if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" -v m="$MAX_AI_BUDGET_USD" 'BEGIN { exit !(b > 0 && b <= m) }'; then
+            echo "::error::ai_budget must be a number above 0 and at most $MAX_AI_BUDGET_USD"; exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - name: Install oasdiff
+        run: |
+          curl -fsSL "https://github.com/oasdiff/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff_${OASDIFF_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin oasdiff
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - name: Check the committed rules
+        working-directory: refit
+        run: node bin/refit.mjs rules check | tee "$RUNNER_TEMP/check.txt"
+      - name: Generate rules
+        working-directory: refit
+        env:
+          VERSIONS: ${{ inputs.versions }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ env.MODEL }}
+          REFIT_AI_BUDGET_USD: ${{ inputs.ai_budget }}
+          REFIT_AI_BUDGET_DIRECTORY: ${{ runner.temp }}/ai-budget
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+          if [ -z "$VERSIONS" ]; then VERSIONS=$(jq -r '[.versions[].version] | .[1:] | join(" ")' data/stripe-openapi-versions.json); fi
+          args=()
+          for version in $VERSIONS; do args+=(--version "$version"); done
+          node bin/refit.mjs rules generate "${args[@]}" --output "$RUNNER_TEMP/out"
+      - name: Summary
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/check.txt" "$RUNNER_TEMP/out/check.txt" 2>/dev/null || true
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+          if [ -f "$RUNNER_TEMP/out/results.json" ]; then
+            { echo '## Stripe rules'; echo; echo '```'; jq 'del(.candidates)' "$RUNNER_TEMP/out/results.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rules
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
