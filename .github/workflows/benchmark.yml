@@ -39,7 +39,7 @@ on:
         options: [gpt-6.1-sol]
         default: gpt-6.1-sol
       flags:
-        description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env)
+        description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env; --stripe-test-mode needs ai and --behaviour-tests)
         required: false
         default: ''
 
@@ -70,10 +70,17 @@ jobs:
       - name: Check flags
         env:
           FLAGS: ${{ inputs.flags }}
+          AI: ${{ inputs.ai }}
+          STRIPE_TEST_KEY: ${{ contains(inputs.flags, '--stripe-test-mode') && secrets.STRIPE_TEST_KEY || '' }}
         run: |
           if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(ai|env|publish)[\ =] ]]; then
             echo "::error::flags may hold only plain options, and never --ai, --env or --publish"
             exit 1
+          fi
+          # Test mode runs the model's behaviour tests, which read the AI env file, so it needs ai.
+          if [[ " $FLAGS " == *" --stripe-test-mode "* ]]; then
+            if [ "$AI" != true ]; then echo "::error::--stripe-test-mode needs ai: true and --behaviour-tests"; exit 1; fi
+            if [ -z "$STRIPE_TEST_KEY" ]; then echo "::error::The STRIPE_TEST_KEY secret is not set"; exit 1; fi
           fi
       - id: shards
         env:
@@ -146,6 +153,8 @@ jobs:
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
           OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          # Only for --stripe-test-mode, which refuses anything but sk_test_ or rk_test_ keys.
+          STRIPE_TEST_KEY: ${{ contains(inputs.flags, '--stripe-test-mode') && secrets.STRIPE_TEST_KEY || '' }}
           # The runner has 16 GB; Node's default heap ran out on SimplerDevelopment.
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
@@ -156,8 +165,10 @@ jobs:
             printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
               "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
             unset OPENAI_API_KEY
+            if [ -n "$STRIPE_TEST_KEY" ]; then printf 'STRIPE_TEST_KEY=%s\n' "$STRIPE_TEST_KEY" >> "$RUNNER_TEMP/ai.env"; fi
             ai=(--ai --env "$RUNNER_TEMP/ai.env")
           fi
+          unset STRIPE_TEST_KEY
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
           # A repository that no longer clones (deleted or private) must not cost the shard its other
