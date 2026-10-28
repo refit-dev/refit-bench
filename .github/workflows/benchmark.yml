@@ -81,6 +81,10 @@ jobs:
           if [[ " $FLAGS " == *" --stripe-test-mode "* ]]; then
             if [ "$AI" != true ]; then echo "::error::--stripe-test-mode needs ai: true and --behaviour-tests"; exit 1; fi
             if [ -z "$STRIPE_TEST_KEY" ]; then echo "::error::The STRIPE_TEST_KEY secret is not set"; exit 1; fi
+            # Same shape Refit accepts (pipeline/stripe-test-mode.ts); a newline would also add lines to ai.env.
+            if ! [[ "$STRIPE_TEST_KEY" =~ ^[[:space:],]*((sk|rk)_test_[A-Za-z0-9]{8,}[[:space:],]*)+$ ]] || [[ "$STRIPE_TEST_KEY" == *$'\n'* ]]; then
+              echo "::error::The STRIPE_TEST_KEY secret must hold only sk_test_ or rk_test_ keys, separated by commas or spaces, on one line"; exit 1
+            fi
           fi
       - id: shards
         env:
