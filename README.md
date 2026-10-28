@@ -18,6 +18,12 @@ gh workflow run shopify.yml -R refit-dev/refit-bench \
   -f list=2026-10-16-shopify-fresh-repos.json -f offset=0 -f count=50 -f size=5
 ```
 
+`rules.yml` runs Refit's `rules check` on the committed Stripe rule tables, then `rules generate` for the pinned API versions with `OPENAI_API_KEY`, and uploads `results.json` and `audit.json` (see `docs/MINED-RULES.md` in Refit). It never writes to Refit.
+
+```sh
+gh workflow run rules.yml -R refit-dev/refit-bench -f commit=<full 40-character Refit SHA> -f ai_budget=1
+```
+
 Logs and artifacts here are public. Secrets: `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository, and `OPENAI_API_KEY`, the owner's capped key, used only by AI runs. Never pass a key through an input.
 
 The `merge` job checks that every repository the plan assigned has exactly one row. A shard that failed at setup shows up in `merged/missing.txt` and in the summary's first lines, and the job fails, so an incomplete run cannot pass for a complete one. Shards pull `node:22-alpine` and `stripe/stripe-mock:latest` (generated checks need it; Refit never pulls images itself), and `merged/images.txt` records the digests used.
