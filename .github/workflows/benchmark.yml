@@ -146,6 +146,10 @@ jobs:
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
           OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          # Stripe test mode: only Refit's own restricted test key, and only when the flag asks for it.
+          # Refit refuses anything but rk_test_/sk_test_ keys, keeps it out of every test container
+          # (a proxy adds it) and redacts it from every recorded output.
+          STRIPE_TEST_KEY: ${{ contains(inputs.flags, '--stripe-test-mode') && secrets.STRIPE_TEST_KEY || '' }}
           # The runner has 16 GB; Node's default heap ran out on SimplerDevelopment.
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
@@ -167,6 +171,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/out"
           npm run benchmark:stripe -- --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
           rm -f "$RUNNER_TEMP/ai.env"
+          unset STRIPE_TEST_KEY
           cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
           # The AI ledger holds spend records only, never the key.
           if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
