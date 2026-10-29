@@ -28,7 +28,7 @@ on:
         required: false
         default: ''
       ai:
-        description: Run AI patches and repair (spends the OPENAI_API_KEY secret's budget)
+        description: Run AI patches and repair (spends the OPENAI_API_KEY or ANTHROPIC_API_KEY secret's budget)
         type: boolean
         default: false
       ai_budget:
@@ -36,10 +36,15 @@ on:
         required: false
         default: '2'
       model:
-        description: OpenAI model for AI patches (priced in pipeline/ai-budget.ts)
+        description: AI model (priced in pipeline/ai-budget.ts); claude-* only with provider anthropic
         type: choice
-        options: [gpt-6.1-sol]
+        options: [gpt-6.1-sol, claude-sonnet-5-5, claude-opus-5-5]
         default: gpt-6.1-sol
+      provider:
+        description: AI backend; anthropic uses the ANTHROPIC_API_KEY secret and a claude-* model instead of OpenAI
+        type: choice
+        options: [openai, anthropic]
+        default: openai
       flags:
         description: Extra benchmark:meta flags
         required: false
@@ -140,16 +145,27 @@ jobs:
           AI: ${{ inputs.ai }}
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
-          OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          PROVIDER: ${{ inputs.provider }}
+          OPENAI_API_KEY: ${{ inputs.ai && inputs.provider != 'anthropic' && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ inputs.ai && inputs.provider == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           ai=()
           if [ "$AI" = true ]; then
-            if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
-            # Ledger per shard; the run's total is ai_budget.
-            printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
-              "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
-            unset OPENAI_API_KEY
+            if [ "$PROVIDER" = anthropic ]; then
+              case "$MODEL" in claude-*) ;; *) echo "::error::provider anthropic needs a claude-* model"; exit 1 ;; esac
+              if [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::The ANTHROPIC_API_KEY secret is not set"; exit 1; fi
+              # Ledger per shard; the run's total is ai_budget.
+              printf 'REFIT_AI_PROVIDER=anthropic\nANTHROPIC_API_KEY=%s\nANTHROPIC_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+                "$ANTHROPIC_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            else
+              case "$MODEL" in gpt-*) ;; *) echo "::error::provider openai needs a gpt-* model"; exit 1 ;; esac
+              if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+              # Ledger per shard; the run's total is ai_budget.
+              printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+                "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            fi
+            unset OPENAI_API_KEY ANTHROPIC_API_KEY
             ai=(--ai --env "$RUNNER_TEMP/ai.env")
           fi
           start=$((OFFSET + SHARD * SIZE))
