@@ -1,9 +1,10 @@
 name: Shopify benchmark
 
-# Runs the Refit Shopify benchmark on GitHub-hosted runners, one job per shard. No secret but
-# REFIT_READ_TOKEN: the `snapshots` job reads the Admin API schemas once from Shopify's public
-# documentation proxy (no store, no credentials) and every shard uses those saved bytes.
-# Logs and artifacts of this public repository are public.
+# Runs the Refit Shopify benchmark on GitHub-hosted runners, one job per shard. The `snapshots` job
+# reads the Admin API schemas once from Shopify's public documentation proxy (no store, no
+# credentials) and every shard uses those saved bytes. Shards get SHOPIFY_TEST_STORE and
+# SHOPIFY_TEST_TOKEN for the development-store proof, and with `ai` the OPENAI_API_KEY secret
+# through a file, never an input. Logs and artifacts of this public repository are public.
 on:
   workflow_dispatch:
     inputs:
@@ -32,8 +33,21 @@ on:
         type: choice
         options: [current, pinned]
         default: current
+      ai:
+        description: Run AI on every Shopify path, repair included (spends the OPENAI_API_KEY secret's budget)
+        type: boolean
+        default: false
+      ai_budget:
+        description: AI cap in USD for the whole run, split evenly across shards (at most 1000, the most Refit accepts)
+        required: false
+        default: '2'
+      model:
+        description: OpenAI model for AI (priced in pipeline/ai-budget.ts)
+        type: choice
+        options: [gpt-6.1-sol]
+        default: gpt-6.1-sol
       flags:
-        description: Extra benchmark:shopify flags, such as --sdk-upgrade
+        description: Extra benchmark:shopify flags, such as --sdk-upgrade (no --ai, no --env)
         required: false
         default: ''
 
@@ -49,6 +63,7 @@ jobs:
     outputs:
       shards: ${{ steps.shards.outputs.shards }}
       end: ${{ steps.shards.outputs.end }}
+      shard_budget: ${{ steps.shards.outputs.shard_budget }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,8 +76,8 @@ jobs:
         env:
           FLAGS: ${{ inputs.flags }}
         run: |
-          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(root|output|list|limit|resume)[\ =] ]]; then
-            echo "::error::flags may hold only plain options, and never --root, --output, --list, --limit or --resume"
+          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(root|output|list|limit|resume|ai|env)[\ =] ]]; then
+            echo "::error::flags may hold only plain options, and never --root, --output, --list, --limit, --resume, --ai or --env"
             exit 1
           fi
       # One shard per `size` repositories; GitHub caps a matrix at 256 jobs.
@@ -72,6 +87,8 @@ jobs:
           OFFSET: ${{ inputs.offset }}
           SIZE: ${{ inputs.size }}
           COUNT: ${{ inputs.count }}
+          AI: ${{ inputs.ai }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
         run: |
           total=$(jq '.repos | length' "docs/benchmarks/$LIST")
           count=$((total - OFFSET))
@@ -80,6 +97,13 @@ jobs:
           shards=$(((count + SIZE - 1) / SIZE))
           if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
           echo "$count repositories in $shards shards"
+          if [ "$AI" = true ]; then
+            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 1000) }'; then
+              echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
+            fi
+            echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
+            echo "AI cap: \$$AI_BUDGET for the run"
+          fi
           echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
           echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
 
@@ -170,8 +194,24 @@ jobs:
           SHARD: ${{ matrix.shard }}
           END: ${{ needs.plan.outputs.end }}
           FLAGS: ${{ inputs.flags }}
+          AI: ${{ inputs.ai }}
+          SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
+          MODEL: ${{ inputs.model }}
+          OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          # The development-store proof (docs/SHOPIFY-PROOF.md); Refit never prints them.
+          SHOPIFY_TEST_STORE: ${{ secrets.SHOPIFY_TEST_STORE }}
+          SHOPIFY_TEST_TOKEN: ${{ secrets.SHOPIFY_TEST_TOKEN }}
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
+          ai=()
+          if [ "$AI" = true ]; then
+            if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+            # Ledger per shard; the run's total is ai_budget. No per-repository cap.
+            printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+              "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            unset OPENAI_API_KEY
+            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+          fi
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
           # The list's schema hashes become those of the snapshots job, so setup reuses its saved
@@ -187,8 +227,11 @@ jobs:
             if [ "$actual" != "$sha256" ]; then echo "::error::Shopify $version snapshot is not $sha256"; exit 1; fi
           done
           mkdir -p "$RUNNER_TEMP/out"
-          npm run benchmark:shopify -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate $FLAGS
+          npm run benchmark:shopify -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
+          rm -f "$RUNNER_TEMP/ai.env"
           cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
       - if: always()
         uses: actions/upload-artifact@v4
         with:
