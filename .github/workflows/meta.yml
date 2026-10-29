@@ -1,0 +1,216 @@
+name: Meta Graph benchmark
+
+# Runs the Refit Meta Graph benchmark (`npm run benchmark:meta --validate`) on GitHub-hosted runners,
+# one job per shard, on a frozen Meta list (docs/benchmarks/subsets/meta-*.json). Each repository
+# with a patch runs `refit run` as a customer's would: dependencies are prepared and its checks run
+# offline in Docker. Meta is never contacted. AI runs only with `ai: true`, and spends the
+# OPENAI_API_KEY secret's budget. Logs and artifacts of this public repository are public.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to benchmark
+        required: true
+      list:
+        description: Frozen Meta Graph list under docs/benchmarks
+        required: true
+        default: subsets/meta-dev-60.json
+      offset:
+        description: First repository of the first shard
+        required: true
+        default: '0'
+      size:
+        description: Repositories per shard
+        required: true
+        default: '10'
+      count:
+        description: Repositories to run from the offset (blank runs the rest of the list)
+        required: false
+        default: ''
+      ai:
+        description: Run AI patches and repair (spends the OPENAI_API_KEY secret's budget)
+        type: boolean
+        default: false
+      ai_budget:
+        description: AI cap in USD for the whole run, split evenly across shards (at most 1000, the most Refit accepts)
+        required: false
+        default: '2'
+      model:
+        description: OpenAI model for AI patches (priced in pipeline/ai-budget.ts)
+        type: choice
+        options: [gpt-6.1-sol]
+        default: gpt-6.1-sol
+      flags:
+        description: Extra benchmark:meta flags
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  REFIT_DOCKER_IMAGE: node:22-alpine
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+      end: ${{ steps.shards.outputs.end }}
+      shard_budget: ${{ steps.shards.outputs.shard_budget }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          persist-credentials: false
+      - name: Check flags
+        env:
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(root|output|list|limit|resume|ai|env|publish)[\ =] ]]; then
+            echo "::error::flags may hold only plain options, and never --root, --output, --list, --limit, --resume, --ai, --env or --publish"
+            exit 1
+          fi
+      - id: shards
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          COUNT: ${{ inputs.count }}
+          AI: ${{ inputs.ai }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+        run: |
+          if [ "$(jq -r .provider "docs/benchmarks/$LIST")" != meta-graph ]; then echo "::error::$LIST is not a Meta Graph list"; exit 1; fi
+          total=$(jq '.repos | length' "docs/benchmarks/$LIST")
+          count=$((total - OFFSET))
+          if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
+          if [ "$count" -le 0 ]; then echo "::error::Offset $OFFSET is past the list's $total repositories"; exit 1; fi
+          shards=$(((count + SIZE - 1) / SIZE))
+          if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
+          echo "$count repositories in $shards shards"
+          echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+          if [ "$AI" = true ]; then
+            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 1000) }'; then
+              echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
+            fi
+            echo "shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')" >> "$GITHUB_OUTPUT"
+            echo "AI cap: \$$AI_BUDGET for the run"
+          fi
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      # Refit never pulls images itself.
+      - run: |
+          docker pull -q "$REFIT_DOCKER_IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      - name: Run benchmark
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          SHARD: ${{ matrix.shard }}
+          END: ${{ needs.plan.outputs.end }}
+          FLAGS: ${{ inputs.flags }}
+          AI: ${{ inputs.ai }}
+          SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
+          MODEL: ${{ inputs.model }}
+          OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          ai=()
+          if [ "$AI" = true ]; then
+            if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+            # Ledger per shard; the run's total is ai_budget.
+            printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+              "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            unset OPENAI_API_KEY
+            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+          fi
+          start=$((OFFSET + SHARD * SIZE))
+          limit=$((END - start < SIZE ? END - start : SIZE))
+          # A repository that no longer clones must not cost the shard its other rows; the
+          # benchmark records it as a clone failure.
+          node scripts/meta-benchmark-setup.mjs --root "$RUNNER_TEMP/root" --list "docs/benchmarks/$LIST" --offset "$start" --limit "$limit" \
+            || echo "::warning::Setup could not clone every repository; the benchmark records each as a clone failure."
+          mkdir -p "$RUNNER_TEMP/out"
+          npm run benchmark:meta -- --root "$RUNNER_TEMP/root" --list "$RUNNER_TEMP/root/list.json" --output "$RUNNER_TEMP/out/run" --validate "${ai[@]}" $FLAGS
+          rm -f "$RUNNER_TEMP/ai.env"
+          cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Merge shard results
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ needs.plan.outputs.end }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          node refit/scripts/benchmark-merge.mjs --shards shards --list "$LIST" --offset "$OFFSET" --end "$END" --commit "$COMMIT" --output merged
+          cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merged
+          path: merged
+      - name: Fail on missing or duplicated repositories
+        run: |
+          if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+            echo "::error::Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt) repositories; see merged/missing.txt"
+            exit 1
+          fi
