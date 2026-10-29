@@ -22,6 +22,10 @@ on:
         description: stripe (rules generate) or shopify (rules mine-shopify, see the mine job)
         required: false
         default: stripe
+      entries:
+        description: Shopify only, space-separated changelog slugs to mine (blank = every change entry)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -117,7 +121,9 @@ jobs:
         env:
           COMMIT: ${{ inputs.commit }}
           AI_BUDGET: ${{ inputs.ai_budget }}
+          ENTRIES: ${{ inputs.entries }}
         run: |
+          if ! [[ "$ENTRIES" =~ ^[a-z0-9\ -]*$ ]]; then echo "::error::entries must be changelog slugs"; exit 1; fi
           if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::commit must be a full 40-character SHA"; exit 1; fi
           if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" -v m="$MAX_SHOPIFY_AI_BUDGET_USD" 'BEGIN { exit !(b > 0 && b <= m) }'; then
             echo "::error::ai_budget must be a number above 0 and at most $MAX_SHOPIFY_AI_BUDGET_USD"; exit 1
@@ -141,6 +147,7 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_BUDGET: ${{ inputs.ai_budget }}
+          ENTRIES: ${{ inputs.entries }}
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
@@ -149,7 +156,9 @@ jobs:
           unset OPENAI_API_KEY
           mkdir -p "$RUNNER_TEMP/out"
           status=0
-          node --env-file="$RUNNER_TEMP/ai.env" bin/refit.mjs rules mine-shopify --write --output "$RUNNER_TEMP/out/mining" || status=$?
+          args=()
+          for entry in $ENTRIES; do args+=(--entry "$entry"); done
+          node --env-file="$RUNNER_TEMP/ai.env" bin/refit.mjs rules mine-shopify --write --output "$RUNNER_TEMP/out/mining" "${args[@]}" || status=$?
           rm -f "$RUNNER_TEMP/ai.env"
           exit $status
       - name: Check the rules
