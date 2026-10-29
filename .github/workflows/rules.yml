@@ -15,20 +15,27 @@ on:
         required: false
         default: ''
       ai_budget:
-        description: AI cap in USD (at most 5)
+        description: AI cap in USD (at most 5 for Stripe, 25 for Shopify)
         required: true
         default: '1'
+      provider:
+        description: stripe (rules generate) or shopify (rules mine-shopify, see the mine job)
+        required: false
+        default: stripe
 
 permissions:
   contents: read
 
 env:
   MAX_AI_BUDGET_USD: 5
+  MAX_SHOPIFY_AI_BUDGET_USD: 25
+  SHOPIFY_MODEL: gpt-6.1-sol
   MODEL: gpt-6.1-sol
   OASDIFF_VERSION: 1.33.0
 
 jobs:
   rules:
+    if: inputs.provider != 'shopify'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -94,5 +101,77 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rules
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  # Shopify: `rules mine-shopify` (docs/SHOPIFY-RULES.md) reads Shopify's developer changelog, proposes
+  # rules and alerts with OpenAI and keeps only those verified against the saved pages and pinned
+  # schemas. It uploads results.json, audit.json, the generated rules and alerts and the saved pages;
+  # a person reviews the artifact and commits it to Refit.
+  mine:
+    if: inputs.provider == 'shopify'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check inputs
+        env:
+          COMMIT: ${{ inputs.commit }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+        run: |
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::commit must be a full 40-character SHA"; exit 1; fi
+          if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" -v m="$MAX_SHOPIFY_AI_BUDGET_USD" 'BEGIN { exit !(b > 0 && b <= m) }'; then
+            echo "::error::ai_budget must be a number above 0 and at most $MAX_SHOPIFY_AI_BUDGET_USD"; exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      - name: Mine the changelog
+        working-directory: refit
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+          printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+            "$OPENAI_API_KEY" "$SHOPIFY_MODEL" "$AI_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+          unset OPENAI_API_KEY
+          mkdir -p "$RUNNER_TEMP/out"
+          status=0
+          node --env-file="$RUNNER_TEMP/ai.env" bin/refit.mjs rules mine-shopify --write --output "$RUNNER_TEMP/out/mining" || status=$?
+          rm -f "$RUNNER_TEMP/ai.env"
+          exit $status
+      - name: Check the rules
+        if: always()
+        working-directory: refit
+        run: node bin/refit.mjs rules check --provider shopify | tee "$RUNNER_TEMP/out/check.txt"
+      - name: Collect
+        if: always()
+        working-directory: refit
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/refit/data" "$RUNNER_TEMP/out/refit/docs/benchmarks"
+          cp -r data/rules "$RUNNER_TEMP/out/refit/data/" 2>/dev/null || true
+          cp data/shopify-alerts.json "$RUNNER_TEMP/out/refit/data/" 2>/dev/null || true
+          cp -r docs/benchmarks/shopify-changelog "$RUNNER_TEMP/out/refit/docs/benchmarks/" 2>/dev/null || true
+          # The AI ledger holds spend records only, never the key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+          if [ -f "$RUNNER_TEMP/out/mining/results.json" ]; then
+            { echo '## Shopify rules'; echo; echo '```'; jq '{costUsd, summary}' "$RUNNER_TEMP/out/mining/results.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopify-rules
           path: ${{ runner.temp }}/out
           if-no-files-found: warn
