@@ -169,14 +169,18 @@ jobs:
           ai=()
           if [ "$AI" = true ]; then
             if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
-            # Ledger per shard; the run's total is ai_budget. Keys go only into this file.
-            umask 077
-            {
-              printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\n' "$OPENAI_API_KEY" "$MODEL"
-              [ -n "$ANTHROPIC_API_KEY" ] && printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
-              [ -n "$GEMINI_API_KEY" ] && printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY"
-              printf 'REFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget"
-            } > "$RUNNER_TEMP/ai.env"
+            # Ledger per shard; the run's total is ai_budget. Keys go only into this file. The
+            # private umask stays in this subshell: the harness's own files must stay readable by
+            # the Docker sandboxes, which run as another user.
+            (
+              umask 077
+              {
+                printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\n' "$OPENAI_API_KEY" "$MODEL"
+                [ -n "$ANTHROPIC_API_KEY" ] && printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
+                [ -n "$GEMINI_API_KEY" ] && printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY"
+                printf 'REFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget"
+              } > "$RUNNER_TEMP/ai.env"
+            )
             unset OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
             ai=(--ai --env "$RUNNER_TEMP/ai.env")
           fi
