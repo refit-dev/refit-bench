@@ -27,3 +27,11 @@ gh workflow run rules.yml -R refit-dev/refit-bench -f commit=<full 40-character 
 Logs and artifacts here are public. Secrets: `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository, and `OPENAI_API_KEY`, the owner's capped key, used only by AI runs. Never pass a key through an input.
 
 The `merge` job checks that every repository the plan assigned has exactly one row. A shard that failed at setup shows up in `merged/missing.txt` and in the summary's first lines, and the job fails, so an incomplete run cannot pass for a complete one. Shards pull `node:22-alpine` and `stripe/stripe-mock:latest` (generated checks need it; Refit never pulls images itself), and `merged/images.txt` records the digests used.
+
+`ai-providers.yml` runs Refit's AI-provider benchmark (OpenAI, Anthropic, Gemini) on a frozen list: `pipeline/ai-provider-benchmark-cli.ts` at the Refit commit scans each repository, proposes model fixes and SDK or API-surface migrations, and validates JS/TS fixes in offline Docker (today's two scripts on commits without it). AI is off unless `ai=true`; then `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `GEMINI_API_KEY` come from repository secrets into a private env file that is deleted after the run, and `ai_budget` must leave at least $0.50 a shard.
+
+```sh
+gh workflow run ai-providers.yml -R refit-dev/refit-bench \
+  -f commit=<full 40-character Refit SHA> \
+  -f list=subsets/openai-dev-30.json -f offset=0 -f size=5
+```
