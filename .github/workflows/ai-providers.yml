@@ -1,0 +1,280 @@
+name: AI provider benchmark
+
+# Runs Refit's AI-provider benchmark (OpenAI, Anthropic, Gemini) on a frozen list, one job per shard:
+# find affected calls, propose fixes, and validate them with the repository's own checks in offline
+# Docker. AI only with `ai: true`. Refit at `commit` decides the harness: `pipeline/ai-provider-benchmark-cli.ts`
+# when the commit has it, else today's two steps (`scripts/ai-model-benchmark.mjs`, then
+# `pipeline/ai-model-validation-cli.ts`). Logs and artifacts of this public repository are public;
+# provider keys come only from repository secrets, are written to a file only when AI is on, and are
+# never inputs or printed.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full 40-character Refit commit SHA to benchmark
+        required: true
+      list:
+        description: Frozen repository list under docs/benchmarks (for example subsets/openai-dev-30.json)
+        required: true
+      offset:
+        description: First repository of the first shard
+        required: true
+        default: '0'
+      size:
+        description: Repositories per shard
+        required: true
+        default: '5'
+      count:
+        description: Repositories to run from the offset (blank runs the rest of the list)
+        required: false
+        default: ''
+      ai:
+        description: Allow AI calls (spends the provider secrets' budget)
+        type: boolean
+        default: false
+      ai_budget:
+        description: AI cap in USD for the whole run, split evenly across shards (at least 0.50 per shard, at most 1000 in all)
+        required: false
+        default: '10'
+      model:
+        description: OpenAI model for Refit's own AI patches (priced in pipeline/ai-budget.ts)
+        type: choice
+        options: [gpt-6.1-sol]
+        default: gpt-6.1-sol
+      flags:
+        description: Extra harness flags, such as an engine's opt-in rewrite flag (plain options only; no --ai, --env or --publish)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  REFIT_DOCKER_IMAGE: node:22-alpine
+  # Below this a shard cannot reserve one call's maximum output, so every AI call is refused.
+  MIN_SHARD_BUDGET_USD: '0.50'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.shards.outputs.shards }}
+      end: ${{ steps.shards.outputs.end }}
+      shard_budget: ${{ steps.shards.outputs.shard_budget }}
+    steps:
+      - name: Check inputs
+        env:
+          COMMIT: ${{ inputs.commit }}
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          COUNT: ${{ inputs.count }}
+          FLAGS: ${{ inputs.flags }}
+        run: |
+          if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(ai|env|publish)[\ =] ]]; then
+            echo "::error::flags may hold only plain options, and never --ai, --env or --publish"; exit 1
+          fi
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then echo "::error::commit must be a full 40-character SHA"; exit 1; fi
+          if ! [[ "$LIST" =~ ^[A-Za-z0-9._/-]+\.json$ ]] || [[ "$LIST" == *..* ]]; then echo "::error::list must be a JSON path under docs/benchmarks"; exit 1; fi
+          for value in "$OFFSET" "$SIZE"; do [[ "$value" =~ ^[0-9]+$ ]] || { echo "::error::offset and size must be whole numbers"; exit 1; }; done
+          [ "$SIZE" -ge 1 ] || { echo "::error::size must be at least 1"; exit 1; }
+          [[ -z "$COUNT" || "$COUNT" =~ ^[0-9]+$ ]] || { echo "::error::count must be a whole number or blank"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          persist-credentials: false
+      - id: shards
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          COUNT: ${{ inputs.count }}
+          AI: ${{ inputs.ai }}
+          AI_BUDGET: ${{ inputs.ai_budget }}
+        run: |
+          total=$(jq '.repos | length' "docs/benchmarks/$LIST")
+          count=$((total - OFFSET))
+          if [ -n "$COUNT" ] && [ "$COUNT" -lt "$count" ]; then count=$COUNT; fi
+          if [ "$count" -le 0 ]; then echo "::error::Offset $OFFSET is past the list's $total repositories"; exit 1; fi
+          shards=$(((count + SIZE - 1) / SIZE))
+          if [ "$shards" -gt 256 ]; then echo "::error::$shards shards exceed the 256-job matrix limit; raise size"; exit 1; fi
+          echo "$count repositories in $shards shards"
+          echo "end=$((OFFSET + count))" >> "$GITHUB_OUTPUT"
+          echo "shards=$(seq 0 $((shards - 1)) | jq -cs .)" >> "$GITHUB_OUTPUT"
+          if [ "$AI" = true ]; then
+            if ! [[ "$AI_BUDGET" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! awk -v b="$AI_BUDGET" 'BEGIN { exit !(b > 0 && b <= 1000) }'; then
+              echo "::error::ai_budget must be a number above 0 and at most 1000"; exit 1
+            fi
+            shard_budget=$(awk -v b="$AI_BUDGET" -v n="$shards" 'BEGIN { printf "%.4f", b / n }')
+            if ! awk -v s="$shard_budget" -v m="$MIN_SHARD_BUDGET_USD" 'BEGIN { exit !(s >= m) }'; then
+              echo "::error::ai_budget \$$AI_BUDGET over $shards shards is \$$shard_budget a shard, below \$$MIN_SHARD_BUDGET_USD; raise ai_budget or size"; exit 1
+            fi
+            echo "shard_budget=$shard_budget" >> "$GITHUB_OUTPUT"
+            echo "AI cap: \$$AI_BUDGET for the run, \$$shard_budget a shard"
+          fi
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          path: refit
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: refit/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: refit
+      # Refit never pulls images itself.
+      - run: |
+          docker pull -q "$REFIT_DOCKER_IMAGE"
+          docker image inspect --format '{{index .RepoDigests 0}}' "$REFIT_DOCKER_IMAGE" | tee "$RUNNER_TEMP/images.txt"
+      - name: Run benchmark
+        working-directory: refit
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          SIZE: ${{ inputs.size }}
+          SHARD: ${{ matrix.shard }}
+          END: ${{ needs.plan.outputs.end }}
+          AI: ${{ inputs.ai }}
+          SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
+          MODEL: ${{ inputs.model }}
+          FLAGS: ${{ inputs.flags }}
+          OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ inputs.ai && secrets.ANTHROPIC_API_KEY || '' }}
+          GEMINI_API_KEY: ${{ inputs.ai && secrets.GEMINI_API_KEY || '' }}
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          start=$((OFFSET + SHARD * SIZE))
+          limit=$((END - start < SIZE ? END - start : SIZE))
+          mkdir -p "$RUNNER_TEMP/out" "$RUNNER_TEMP/root"
+          # The shard's slice of the frozen list, with the list's own fields kept.
+          jq --argjson start "$start" --argjson limit "$limit" '.repos |= .[$start:$start + $limit]' \
+            "docs/benchmarks/$LIST" > "$RUNNER_TEMP/slice.json"
+          ai=()
+          if [ "$AI" = true ]; then
+            if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+            # Ledger per shard; the run's total is ai_budget. Keys go only into this file.
+            umask 077
+            {
+              printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\n' "$OPENAI_API_KEY" "$MODEL"
+              [ -n "$ANTHROPIC_API_KEY" ] && printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
+              [ -n "$GEMINI_API_KEY" ] && printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY"
+              printf 'REFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget"
+            } > "$RUNNER_TEMP/ai.env"
+            unset OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+            ai=(--ai --env "$RUNNER_TEMP/ai.env")
+          fi
+          unset OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+          if [ -f pipeline/ai-provider-benchmark-cli.ts ]; then
+            npx tsx pipeline/ai-provider-benchmark-cli.ts --list "$RUNNER_TEMP/slice.json" --root "$RUNNER_TEMP/root" \
+              --output "$RUNNER_TEMP/out/results.json" --image "$REFIT_DOCKER_IMAGE" --validate "${ai[@]}" $FLAGS
+          else
+            # Before the unified harness: rules only, so AI and flags are not used even when given.
+            if [ -n "$FLAGS" ]; then echo "::warning::This Refit commit has no pipeline/ai-provider-benchmark-cli.ts; flags are ignored"; fi
+            node scripts/ai-model-benchmark.mjs --list "$RUNNER_TEMP/slice.json" --root "$RUNNER_TEMP/root" --output "$RUNNER_TEMP/out/scan.json"
+            npx tsx pipeline/ai-model-validation-cli.ts --results "$RUNNER_TEMP/out/scan.json" --root "$RUNNER_TEMP/root" \
+              --image "$REFIT_DOCKER_IMAGE" --output "$RUNNER_TEMP/out/validation.json"
+          fi
+          rm -f "$RUNNER_TEMP/ai.env"
+          cp "$RUNNER_TEMP/images.txt" "$RUNNER_TEMP/out/images.txt"
+          # The AI ledger holds spend records only, never a key.
+          if [ -d "$RUNNER_TEMP/ai-budget" ]; then cp -r "$RUNNER_TEMP/ai-budget" "$RUNNER_TEMP/out/ai-budget"; fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out
+          if-no-files-found: warn
+
+  merge:
+    needs: [plan, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: pierceluu10/Refit
+          ref: ${{ inputs.commit }}
+          token: ${{ secrets.REFIT_READ_TOKEN }}
+          sparse-checkout: docs/benchmarks
+          persist-credentials: false
+          path: refit
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+      - name: Merge shard results
+        env:
+          LIST: ${{ inputs.list }}
+          OFFSET: ${{ inputs.offset }}
+          END: ${{ needs.plan.outputs.end }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          mkdir merged
+          shopt -s nullglob
+          # Rows from either harness: results.json (unified) or scan.json (two-step); both hold .results.
+          rows=()
+          for dir in shards/shard-*; do
+            if [ -f "$dir/results.json" ]; then rows+=("$dir/results.json"); elif [ -f "$dir/scan.json" ]; then rows+=("$dir/scan.json"); fi
+          done
+          if [ ${#rows[@]} -gt 0 ]; then jq -s '[.[].results[]]' "${rows[@]}" > merged/results.json; else echo '[]' > merged/results.json; fi
+          validations=(shards/shard-*/validation.json)
+          if [ ${#validations[@]} -gt 0 ]; then jq -s '[.[].validated[]]' "${validations[@]}" > merged/validation.json; fi
+          jq -r --argjson offset "$OFFSET" --argjson end "$END" '.repos[$offset:$end][].repo' "refit/docs/benchmarks/$LIST" | sort > merged/expected.txt
+          jq -r '.[].repo' merged/results.json | sort > merged/present.txt
+          comm -23 merged/expected.txt <(sort -u merged/present.txt) > merged/missing.txt
+          comm -13 merged/expected.txt <(sort -u merged/present.txt) > merged/unexpected.txt
+          uniq -d merged/present.txt > merged/duplicated.txt
+          cat shards/shard-*/images.txt 2>/dev/null | sort -u > merged/images.txt || true
+          # Each shard's ledger (pipeline/ai-budget.ts) records spentNano; 1 USD is 1e9 nano.
+          ledgers=(shards/shard-*/ai-budget/budget.json)
+          if [ ${#ledgers[@]} -gt 0 ]; then spend=$(jq -s '[.[].spentNano] | add / 1e9' "${ledgers[@]}"); else spend=0; fi
+          {
+            echo "# Merged AI provider benchmark: $(jq length merged/results.json) of $(wc -l < merged/expected.txt) repositories"
+            echo
+            echo "Commit \`$COMMIT\`, list \`$LIST\`, repositories $OFFSET to $END. Images: $(paste -sd ' ' merged/images.txt)"
+            echo
+            if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+              echo "**Incomplete run.** Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt)."
+              echo
+            fi
+            echo "| Outcome | Repositories |"
+            echo "|---|---|"
+            jq -r 'group_by(.outcome // .outcomeClass // "unclassified")[] | "| \(.[0].outcome // .[0].outcomeClass // "unclassified") | \(length) |"' merged/results.json
+            if [ -f merged/validation.json ]; then
+              echo
+              echo "| Validation status | Repositories |"
+              echo "|---|---|"
+              jq -r 'group_by(.status)[] | "| \(.[0].status) | \(length) |"' merged/validation.json
+            fi
+            echo
+            echo "AI spend: \$$spend"
+          } > merged/summary.md
+          cat merged/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merged
+          path: merged
+      - name: Fail on missing or duplicated repositories
+        run: |
+          if [ -s merged/missing.txt ] || [ -s merged/unexpected.txt ] || [ -s merged/duplicated.txt ]; then
+            echo "::error::Missing $(wc -l < merged/missing.txt), unexpected $(wc -l < merged/unexpected.txt), duplicated $(wc -l < merged/duplicated.txt) repositories; see merged/missing.txt"
+            exit 1
+          fi
