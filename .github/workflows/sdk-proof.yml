@@ -2,7 +2,7 @@ name: SDK request proof
 
 # Runs `refit ai-migrations --prove-table` at a pinned Refit commit: for each call shape in Refit's
 # data/sdk-request-proofs.json, the smallest request on the newest release of the SDK major an
-# upgrade moves to (openai 6.x, @anthropic-ai/sdk 1.x), with a stream, a forced tool call and JSON
+# upgrade moves to (openai 6.x, @anthropic-ai/sdk 1.x, @google/genai 2.x), with a stream, a forced tool call and JSON
 # output where the shape has them, sent with Refit's own keys from repository secrets, never a
 # customer's. A provider whose secret is missing stays pending with that reason. It never writes to
 # Refit: a person copies the uploaded sdk-request-proofs.json into Refit's data/.
@@ -45,8 +45,8 @@ jobs:
       - name: Install the target SDK majors
         run: |
           mkdir -p "$RUNNER_TEMP/sdk"
-          npm install --prefix "$RUNNER_TEMP/sdk" --no-save --no-audit --no-fund --ignore-scripts 'openai@6' '@anthropic-ai/sdk@1'
-          node -e 'const v=(n)=>require(process.env.RUNNER_TEMP+"/sdk/node_modules/"+n+"/package.json").version; console.log(`openai@${v("openai")},@anthropic-ai/sdk@${v("@anthropic-ai/sdk")}`)' > "$RUNNER_TEMP/releases.txt"
+          npm install --prefix "$RUNNER_TEMP/sdk" --no-save --no-audit --no-fund --ignore-scripts 'openai@6' '@anthropic-ai/sdk@1' '@google/genai@2'
+          node -e 'const v=(n)=>require(process.env.RUNNER_TEMP+"/sdk/node_modules/"+n+"/package.json").version; console.log(`openai@${v("openai")},@anthropic-ai/sdk@${v("@anthropic-ai/sdk")},@google/genai@${v("@google/genai")}`)' > "$RUNNER_TEMP/releases.txt"
           cat "$RUNNER_TEMP/releases.txt"
       - name: Send the proof requests
         working-directory: refit
@@ -54,6 +54,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           node bin/refit.mjs ai-migrations --prove-table \
             --sdk-directory "$RUNNER_TEMP/sdk" \
