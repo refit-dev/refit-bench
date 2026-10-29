@@ -26,7 +26,7 @@ on:
         required: false
         default: '5'
       ai:
-        description: Run AI patches and repair (spends the OPENAI_API_KEY secret's budget)
+        description: Run AI patches and repair (spends the OPENAI_API_KEY or ANTHROPIC_API_KEY secret's budget)
         type: boolean
         default: false
       ai_budget:
@@ -34,12 +34,17 @@ on:
         required: false
         default: '2'
       model:
-        description: OpenAI model for AI patches (priced in pipeline/ai-budget.ts)
+        description: AI model (priced in pipeline/ai-budget.ts); claude-* only with provider anthropic
         type: choice
-        options: [gpt-6.1-sol]
+        options: [gpt-6.1-sol, claude-sonnet-5-5, claude-opus-5-5]
         default: gpt-6.1-sol
+      provider:
+        description: AI backend; anthropic uses the ANTHROPIC_API_KEY secret and a claude-* model instead of OpenAI
+        type: choice
+        options: [openai, anthropic]
+        default: openai
       flags:
-        description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env)
+        description: Extra benchmark:stripe flags, such as --publish-unresolved (no --ai, no --env; --stripe-test-mode needs ai and --behaviour-tests)
         required: false
         default: ''
 
@@ -70,10 +75,21 @@ jobs:
       - name: Check flags
         env:
           FLAGS: ${{ inputs.flags }}
+          AI: ${{ inputs.ai }}
+          STRIPE_TEST_KEY: ${{ contains(inputs.flags, '--stripe-test-mode') && secrets.STRIPE_TEST_KEY || '' }}
         run: |
           if ! [[ "$FLAGS" =~ ^[A-Za-z0-9\ ._=/,-]*$ ]] || [[ " $FLAGS " =~ \ --(ai|env|publish)[\ =] ]]; then
             echo "::error::flags may hold only plain options, and never --ai, --env or --publish"
             exit 1
+          fi
+          # Test mode runs the model's behaviour tests, which read the AI env file, so it needs ai.
+          if [[ " $FLAGS " == *" --stripe-test-mode "* ]]; then
+            if [ "$AI" != true ]; then echo "::error::--stripe-test-mode needs ai: true and --behaviour-tests"; exit 1; fi
+            if [ -z "$STRIPE_TEST_KEY" ]; then echo "::error::The STRIPE_TEST_KEY secret is not set"; exit 1; fi
+            # Same shape Refit accepts (pipeline/stripe-test-mode.ts); a newline would also add lines to ai.env.
+            if ! [[ "$STRIPE_TEST_KEY" =~ ^[[:space:],]*((sk|rk)_test_[A-Za-z0-9]{8,}[[:space:],]*)+$ ]] || [[ "$STRIPE_TEST_KEY" == *$'\n'* ]]; then
+              echo "::error::The STRIPE_TEST_KEY secret must hold only sk_test_ or rk_test_ keys, separated by commas or spaces, on one line"; exit 1
+            fi
           fi
       - id: shards
         env:
@@ -145,19 +161,34 @@ jobs:
           AI: ${{ inputs.ai }}
           SHARD_BUDGET: ${{ needs.plan.outputs.shard_budget }}
           MODEL: ${{ inputs.model }}
-          OPENAI_API_KEY: ${{ inputs.ai && secrets.OPENAI_API_KEY || '' }}
+          PROVIDER: ${{ inputs.provider }}
+          OPENAI_API_KEY: ${{ inputs.ai && inputs.provider != 'anthropic' && secrets.OPENAI_API_KEY || '' }}
+          ANTHROPIC_API_KEY: ${{ inputs.ai && inputs.provider == 'anthropic' && secrets.ANTHROPIC_API_KEY || '' }}
+          # Only for --stripe-test-mode, which refuses anything but sk_test_ or rk_test_ keys.
+          STRIPE_TEST_KEY: ${{ contains(inputs.flags, '--stripe-test-mode') && secrets.STRIPE_TEST_KEY || '' }}
           # The runner has 16 GB; Node's default heap ran out on SimplerDevelopment.
           NODE_OPTIONS: --max-old-space-size=8192
         run: |
           ai=()
           if [ "$AI" = true ]; then
-            if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
-            # Ledger per shard; the run's total is ai_budget.
-            printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
-              "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
-            unset OPENAI_API_KEY
+            if [ "$PROVIDER" = anthropic ]; then
+              case "$MODEL" in claude-*) ;; *) echo "::error::provider anthropic needs a claude-* model"; exit 1 ;; esac
+              if [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::The ANTHROPIC_API_KEY secret is not set"; exit 1; fi
+              # Ledger per shard; the run's total is ai_budget.
+              printf 'REFIT_AI_PROVIDER=anthropic\nANTHROPIC_API_KEY=%s\nANTHROPIC_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+                "$ANTHROPIC_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            else
+              case "$MODEL" in gpt-*) ;; *) echo "::error::provider openai needs a gpt-* model"; exit 1 ;; esac
+              if [ -z "$OPENAI_API_KEY" ]; then echo "::error::The OPENAI_API_KEY secret is not set"; exit 1; fi
+              # Ledger per shard; the run's total is ai_budget.
+              printf 'OPENAI_API_KEY=%s\nOPENAI_MODEL=%s\nREFIT_AI_BUDGET_USD=%s\nREFIT_AI_BUDGET_DIRECTORY=%s\n' \
+                "$OPENAI_API_KEY" "$MODEL" "$SHARD_BUDGET" "$RUNNER_TEMP/ai-budget" > "$RUNNER_TEMP/ai.env"
+            fi
+            unset OPENAI_API_KEY ANTHROPIC_API_KEY
+            if [ -n "$STRIPE_TEST_KEY" ]; then printf 'STRIPE_TEST_KEY=%s\n' "$STRIPE_TEST_KEY" >> "$RUNNER_TEMP/ai.env"; fi
             ai=(--ai --env "$RUNNER_TEMP/ai.env")
           fi
+          unset STRIPE_TEST_KEY
           start=$((OFFSET + SHARD * SIZE))
           limit=$((END - start < SIZE ? END - start : SIZE))
           # A repository that no longer clones (deleted or private) must not cost the shard its other

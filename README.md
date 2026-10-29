@@ -24,7 +24,7 @@ gh workflow run shopify.yml -R refit-dev/refit-bench \
 gh workflow run rules.yml -R refit-dev/refit-bench -f commit=<full 40-character Refit SHA> -f ai_budget=1
 ```
 
-Logs and artifacts here are public. Secrets: `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository, and `OPENAI_API_KEY`, the owner's capped key, used only by AI runs. Never pass a key through an input.
+Logs and artifacts here are public. Secrets: `REFIT_READ_TOKEN`, a fine-grained token with read-only Contents access to the Refit repository, and `OPENAI_API_KEY`, the owner's capped key, used only by AI runs. `STRIPE_TEST_KEY` holds Refit's own Stripe test-mode key; `benchmark.yml` passes it only when `flags` contain `--stripe-test-mode` (with `ai: true` and `--behaviour-tests`), in the same env file as the OpenAI key, and Refit refuses any key that is not `sk_test_` or `rk_test_`. Never pass a key through an input.
 
 The `merge` job checks that every repository the plan assigned has exactly one row. A shard that failed at setup shows up in `merged/missing.txt` and in the summary's first lines, and the job fails, so an incomplete run cannot pass for a complete one. Shards pull `node:22-alpine` and `stripe/stripe-mock:latest` (generated checks need it; Refit never pulls images itself), and `merged/images.txt` records the digests used.
 
